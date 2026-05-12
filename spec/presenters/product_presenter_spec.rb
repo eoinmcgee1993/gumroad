@@ -473,10 +473,19 @@ describe ProductPresenter do
             fine_print: nil,
           },
           cancellation_discounts_enabled: false,
+          price_checker_enabled: false,
           ai_generated: false,
           dropbox_api_key: DROPBOX_PICKER_API_KEY,
         }
       )
+    end
+
+    context "when the price_checker feature flag is enabled for the seller" do
+      before { Flipper.enable(:price_checker, product.user) }
+
+      it "exposes price_checker_enabled: true in edit_props" do
+        expect(presenter.edit_props[:price_checker_enabled]).to eq(true)
+      end
     end
 
     context "with default offer code" do
@@ -709,6 +718,7 @@ describe ProductPresenter do
               fine_print: nil,
             },
             cancellation_discounts_enabled: true,
+            price_checker_enabled: false,
             ai_generated: false,
             dropbox_api_key: DROPBOX_PICKER_API_KEY,
           }
@@ -923,6 +933,7 @@ describe ProductPresenter do
               fine_print: nil,
             },
             cancellation_discounts_enabled: false,
+            price_checker_enabled: false,
             ai_generated: false,
             dropbox_api_key: DROPBOX_PICKER_API_KEY,
           }

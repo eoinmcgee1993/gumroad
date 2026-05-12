@@ -797,6 +797,7 @@ Rails.application.routes.draw do
     get "/products/:id/edit", to: "links#edit", as: :edit_link
     get "/products/:id/edit/*other", to: "links#edit"
     get "/products/:id/card", to: "links#card", as: :product_card
+    post "/products/:id/price_check", to: "links#price_check", as: :price_check_product, defaults: { format: :json }
     get "/products/search", to: "links#search"
 
     namespace :integrations do
