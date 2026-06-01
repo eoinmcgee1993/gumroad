@@ -10,6 +10,25 @@ module Compliance
       ISO3166::Country.all.to_h { |country| [country.alpha2, country.common_name] }
     end
 
+    def self.alpha2_by_name
+      @alpha2_by_name ||= begin
+        result = {}
+        all = ISO3166::Country.all
+        all.each do |country|
+          [country.common_name, country.iso_short_name, country.iso_long_name].compact.each do |name|
+            result[name.downcase] ||= country.alpha2
+          end
+        end
+        all.each do |country|
+          country.unofficial_names&.each { |name| result[name.downcase] ||= country.alpha2 }
+        end
+        all.each do |country|
+          country.data["gumroad_historical_names"]&.each { |name| result[name.downcase] ||= country.alpha2 }
+        end
+        result.freeze
+      end
+    end
+
     def self.find_by_name(country_name)
       return if country_name.blank?
       ISO3166::Country.find_country_by_any_name(country_name)

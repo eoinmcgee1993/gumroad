@@ -10,6 +10,31 @@ describe Compliance do
       end
     end
 
+    describe ".alpha2_by_name" do
+      it "maps common, ISO, unofficial, and historical country names (case-insensitively) to country codes" do
+        expect(Compliance::Countries.alpha2_by_name).to include(
+          "united states" => "US",
+          "the netherlands" => "NL",
+          "russia" => "RU",
+          "congo republic" => "CG",
+          "macedonia" => "MK",
+          "réunion" => "RE",
+          "macau" => "MO",
+          "ivory coast" => "CI",
+        )
+      end
+
+      it "downcases keys so casing variations in stored country names still resolve" do
+        lookup = Compliance::Countries.alpha2_by_name
+        expect(lookup["macedonia, the former yugoslav republic of"]).to eq("MK")
+        expect(lookup["MACEDONIA".downcase]).to eq("MK")
+      end
+
+      it "keeps common-name precedence over unofficial and historical aliases" do
+        expect(Compliance::Countries.alpha2_by_name["united states"]).to eq("US")
+      end
+    end
+
     describe ".find_by_name" do
       it "returns the country for a country whose name is the same for `countries` gem and `iso_country_codes` gem" do
         expect(Compliance::Countries.find_by_name("Mexico")).to eq(Compliance::Countries::MEX)
