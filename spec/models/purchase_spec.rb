@@ -1200,6 +1200,34 @@ describe Purchase, :vcr do
     end
   end
 
+  context "when is_applying_plan_change is true on a require_shipping product" do
+    it "skips address presence validations on :create so plan-change application can proceed for legacy subscribers without an address" do
+      purchase = build(:purchase,
+                       street_address: nil, full_name: nil, country: nil, state: nil, city: nil, zip_code: nil,
+                       link: create(:product, require_shipping: true))
+      purchase.is_applying_plan_change = true
+
+      expect(purchase).to be_valid
+      %i[full_name street_address country state city zip_code].each do |field|
+        expect(purchase.errors[field]).to be_empty
+      end
+    end
+
+    it "skips address presence validations on :update so later updates to the placeholder purchase don't fail" do
+      purchase = build(:purchase,
+                       street_address: nil, full_name: nil, country: nil, state: nil, city: nil, zip_code: nil,
+                       link: create(:product, require_shipping: true))
+      purchase.is_updated_original_subscription_purchase = true
+      purchase.save!(validate: false)
+      purchase.is_applying_plan_change = true
+
+      expect(purchase.valid?(:update)).to be true
+      %i[full_name street_address country state city zip_code].each do |field|
+        expect(purchase.errors[field]).to be_empty
+      end
+    end
+  end
+
   describe "limiting # of sales for a link" do
     let(:user) { create(:user) }
     let(:link) { create(:product, max_purchase_count: 1) }
