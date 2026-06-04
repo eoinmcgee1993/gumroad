@@ -15,6 +15,17 @@ class Ai::PageSanitizer
     fonts.bunny.net
   ].freeze
 
+  # Canonical embed hosts only (www variants). These must stay aligned with the
+  # `frame-src` list in CUSTOM_HTML_CSP (links_controller.rb): an apex host that
+  # passed sanitization but was missing from frame-src would be silently
+  # CSP-blocked at render with no save-time signal. Apex URLs are rejected here
+  # so the seller gets the "iframe src host not allowed" report entry instead.
+  ALLOWED_IFRAME_HOSTS = %w[
+    www.youtube-nocookie.com
+    www.youtube.com
+    player.vimeo.com
+  ].freeze
+
   # `html`/`head`/`body` are intentionally absent — they're handled first by
   # the WRAPPER_TAGS unwrap in scrub_node, so listing them here would be dead,
   # misleading allowlist entries.
@@ -26,10 +37,10 @@ class Ai::PageSanitizer
   ].freeze
 
   ALLOWED_ATTRIBUTES = %w[
-    accept accept-charset alt aria-describedby aria-hidden aria-label aria-labelledby aria-live aria-pressed async autocomplete autofocus autoplay checked cite class
+    accept accept-charset allow allowfullscreen alt aria-describedby aria-hidden aria-label aria-labelledby aria-live aria-pressed async autocomplete autofocus autoplay checked cite class
     charset cols colspan content contenteditable controls coords crossorigin datetime defer dir disabled download draggable enctype
     fill for form height hidden href id kind label lang loading loop max maxlength media method min minlength multiple muted name pattern placeholder playsinline poster
-    preserveaspectratio readonly rel required role rows rowspan sandbox scope selected shape size sizes span spellcheck src srcset step style tabindex target title translate type
+    preserveaspectratio readonly referrerpolicy rel required role rows rowspan sandbox scope selected shape size sizes span spellcheck src srcset step style tabindex target title translate type
     value viewbox width xmlns x y x1 y1 x2 y2 cx cy r rx ry d stroke stroke-width stroke-linecap stroke-linejoin fill-rule clip-rule clip-path points transform offset stop-color
     stop-opacity
   ].freeze
@@ -104,9 +115,25 @@ class Ai::PageSanitizer
       return
     end
 
-    # Overwrite unconditionally — a seller-supplied permissive value
-    # (e.g. `allow-same-origin`) should not survive the sanitizer.
-    node["sandbox"] = "allow-scripts" if node.name == "iframe"
+    if node.name == "iframe"
+      if document_source_data_url?(node.name, "src", node["src"])
+        node["sandbox"] = "allow-scripts"
+      else
+        unless allowed_iframe_src?(node["src"])
+          record_removed_tag(report, node, "iframe src host not allowed")
+          node.remove
+          return
+        end
+
+        # Overwrite unconditionally — a seller-supplied permissive value should
+        # not survive the sanitizer. The parent document's sandbox (CUSTOM_HTML_CSP)
+        # grants neither allow-same-origin nor allow-presentation, and a nested
+        # browsing context's active sandbox is the union of restrictions, so those
+        # tokens would be dead here. Keep just allow-scripts — public video
+        # playback works via the postMessage IFrame API regardless of opaque origin.
+        node["sandbox"] = "allow-scripts"
+      end
+    end
     if node.name == "form" && node["action"].present?
       record_removed_attribute(report, node, "action", node["action"], "form action removed")
       node.remove_attribute("action")
@@ -122,6 +149,8 @@ class Ai::PageSanitizer
       record_removed_attribute(report, node, attribute.name, attribute.value, reason)
       node.remove_attribute(attribute.name)
     end
+
+    node["rel"] = "noopener noreferrer" if node.name == "a" && node["target"].to_s.strip.casecmp("_blank").zero?
   end
 
   def self.attribute_removal_reason(tag_name, name, value)
@@ -224,6 +253,10 @@ class Ai::PageSanitizer
     https_host_in?(node["href"], ALLOWED_STYLESHEET_HOSTS)
   end
 
+  def self.allowed_iframe_src?(src)
+    https_host_in?(src, ALLOWED_IFRAME_HOSTS)
+  end
+
   def self.https_host_in?(url, hosts)
     return false if url.blank?
 
@@ -250,5 +283,5 @@ class Ai::PageSanitizer
     decoded.gsub(/[[:space:]\u0000-\u001f]+/, "").downcase
   end
 
-  private_class_method :scrub_node, :allowed_tag?, :allowed_attribute?, :event_handler_attribute?, :dangerous_url_attribute?, :document_source_data_url?, :srcset_url_removal_reason, :srcset_urls, :allowed_script_src?, :allowed_stylesheet_link?, :https_host_in?, :unsafe_target_reason, :normalize_url, :finalize_report, :record_removed_tag, :record_removed_attribute, :report_cap_reached?, :dangerous_url_reason, :strip_control_chars, :attribute_removal_reason
+  private_class_method :scrub_node, :allowed_tag?, :allowed_attribute?, :event_handler_attribute?, :dangerous_url_attribute?, :document_source_data_url?, :srcset_url_removal_reason, :srcset_urls, :allowed_script_src?, :allowed_stylesheet_link?, :allowed_iframe_src?, :https_host_in?, :unsafe_target_reason, :normalize_url, :finalize_report, :record_removed_tag, :record_removed_attribute, :report_cap_reached?, :dangerous_url_reason, :strip_control_chars, :attribute_removal_reason
 end
