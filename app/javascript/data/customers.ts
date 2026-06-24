@@ -57,6 +57,8 @@ export type Customer = {
   id: string;
   email: string;
   giftee_email: string | null;
+  is_gift_sender_purchase: boolean;
+  is_gift_receiver_purchase: boolean;
   is_existing_user: boolean;
   can_contact: boolean;
   name: string;
@@ -235,13 +237,47 @@ export const resendReceipt = (purchaseId: string) =>
     if (!response.ok) throw new ResponseError();
   });
 
+type ErrorResponse = { message?: string; error?: string; error_message?: string };
+
+const getErrorMessage = async (response: Response) => {
+  try {
+    const { message, error, error_message } = typia.assert<ErrorResponse>(await response.json());
+    return [message, error, error_message].find(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+  } catch {}
+
+  return undefined;
+};
+
 export const resendPost = async (purchaseId: string, postId: string) => {
   const response = await request({
     method: "POST",
     accept: "json",
     url: Routes.send_for_purchase_path(postId, purchaseId),
   });
-  if (!response.ok) throw new ResponseError(typia.assert<{ message: string }>(await response.json()).message);
+  if (!response.ok) throw new ResponseError(await getErrorMessage(response));
+};
+
+type SingleCustomerEmailFile = {
+  external_id: string;
+  position: number;
+  url: string;
+  stream_only: boolean;
+  subtitle_files: { url: string; language: string }[];
+};
+
+export const sendSingleCustomerEmail = async (
+  purchaseId: string,
+  data: { name: string; message: string; files: SingleCustomerEmailFile[] },
+) => {
+  const response = await request({
+    method: "POST",
+    accept: "json",
+    url: Routes.internal_single_customer_email_path(purchaseId),
+    data,
+  });
+  if (!response.ok) throw new ResponseError(await getErrorMessage(response));
 };
 
 export const updatePurchase = (

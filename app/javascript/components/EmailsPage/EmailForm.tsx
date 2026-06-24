@@ -6,6 +6,7 @@ import { addHours, format, startOfDay, startOfHour } from "date-fns";
 import React from "react";
 import typia from "typia";
 
+import { sendSingleCustomerEmail } from "$app/data/customers";
 import { AudienceType, getRecipientCount, InstallmentFormContext, Installment } from "$app/data/installments";
 import { type EmailTab, TYPE_TO_TAB } from "$app/data/installments";
 import { assertDefined } from "$app/utils/assert";
@@ -30,7 +31,11 @@ import { EvaporateUploaderProvider } from "$app/components/EvaporateUploader";
 import { LoadingSpinner } from "$app/components/LoadingSpinner";
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "$app/components/Popover";
 import { PriceInput } from "$app/components/PriceInput";
-import { ImageUploadSettingsContext, RichTextEditor } from "$app/components/RichTextEditor";
+import {
+  ImageUploadSettingsContext,
+  RichTextEditor,
+  serializeEditorContentToHTML,
+} from "$app/components/RichTextEditor";
 import { S3UploadConfigProvider } from "$app/components/S3UploadConfig";
 import { Separator } from "$app/components/Separator";
 import { showAlert } from "$app/components/server-components/Alert";
@@ -75,6 +80,14 @@ type SaveAction =
   | "save_and_preview_post"
   | "save_and_schedule"
   | "save_and_publish";
+
+const hasMessageContent = (message: string) => {
+  const document = new DOMParser().parseFromString(message, "text/html");
+  return (
+    (document.body.textContent ?? "").trim().length > 0 ||
+    document.body.querySelector("img, video, audio, iframe, figure") !== null
+  );
+};
 
 const getRecipientType = (audienceType: AudienceType, boughtItems: ProductOrVariantOption[]) => {
   if (audienceType === "everyone") return "audience";
@@ -179,6 +192,7 @@ const DEFAULT_SECONDS_LEFT_TO_PUBLISH = 5;
 type EmailFormProps = {
   context: InstallmentFormContext;
   installment: Installment | null;
+  singleCustomerRecipient?: { purchase_id: string; email: string } | null;
 };
 
 const isJSONContent = (value: unknown): value is JSONContent =>
@@ -206,7 +220,7 @@ const TAB_TO_PATH: Record<EmailTab, string> = {
   subscribers: Routes.followers_path(),
 };
 
-export const EmailForm = ({ context, installment }: EmailFormProps) => {
+export const EmailForm = ({ context, installment, singleCustomerRecipient = null }: EmailFormProps) => {
   const uid = React.useId();
   const currentSeller = assertDefined(useCurrentSeller());
   const hasAudience = context.audience_types.length > 0;
@@ -226,6 +240,7 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
     total: number;
     loading: boolean;
   }>({ count: 0, total: 0, loading: false });
+  const [singleRecipient, setSingleRecipient] = React.useState<{ purchaseId: string; email: string } | null>(null);
   const activeRecipientCountRequest = React.useRef<{ cancel: () => void } | null>(null);
   // Use browser APIs for URL params
   const searchParams = new URLSearchParams(window.location.search);
@@ -289,6 +304,8 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
   );
 
   const [messageEditor, setMessageEditor] = React.useState<Editor | null>(null);
+  const getCurrentMessage = () =>
+    messageEditor ? serializeEditorContentToHTML(messageEditor) : form.data.installment.message;
   React.useEffect(() => {
     if (form.data.installment.message !== "" && messageEditor?.isEmpty) {
       queueMicrotask(() => {
@@ -382,6 +399,16 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
     const canSendToCustomers = context.audience_types.includes("customers");
     const template = searchParams.get("template");
     const isBundleMarketing = template === "bundle_marketing";
+
+    if (template === "single_customer") {
+      const singlePurchaseId = searchParams.get("purchase_id");
+      if (singlePurchaseId && canSendToCustomers) {
+        setSingleRecipient({ purchaseId: singlePurchaseId, email: singleCustomerRecipient?.email ?? "" });
+        setAudienceType("customers");
+        setChannel({ profile: false, email: true });
+      }
+      return;
+    }
 
     if (template === "filtered_customers") {
       if (canSendToCustomers) {
@@ -582,6 +609,13 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
     allow_comments: allowComments,
   };
   React.useEffect(() => {
+    if (singleRecipient) {
+      activeRecipientCountRequest.current?.cancel();
+      activeRecipientCountRequest.current = null;
+      setRecipientCount({ count: 1, total: 1, loading: false });
+      return;
+    }
+
     setRecipientCount((prev) => ({ ...prev, loading: true }));
 
     asyncVoid(async () => {
@@ -602,7 +636,7 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
         assertResponseError(error);
       }
     })();
-  }, [JSON.stringify(filtersPayload)]);
+  }, [JSON.stringify(filtersPayload), singleRecipient?.purchaseId]);
   const isPublished = !!(installment?.external_id && installment.published_at);
 
   const validate = (action: SaveAction) => {
@@ -679,40 +713,45 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
     setSecondsLeftToPublish(0);
   }, []);
 
+  const buildPayload = (
+    action: SaveAction,
+    installmentFiltersPayload = filtersPayload,
+    selectedProductId = productId,
+    selectedVariantId = variantId,
+  ) => ({
+    installment: {
+      name: form.data.installment.name,
+      message: form.data.installment.message,
+      files: files.map((file, position) => ({
+        external_id: file.id,
+        position,
+        url: file.url,
+        stream_only: file.is_streamable && isStreamOnly,
+        subtitle_files: file.subtitle_files,
+      })),
+      link_id: selectedProductId,
+      published_at:
+        isPublished &&
+        publishDate !== toISODateString(installment.published_at) &&
+        action !== "save_and_schedule" &&
+        action !== "save_and_publish"
+          ? publishDate
+          : null,
+      shown_in_profile_sections: audienceType === "everyone" && channel.profile ? [...shownInProfileSections] : [],
+      ...installmentFiltersPayload,
+    },
+    variant_external_id: selectedVariantId,
+    send_preview_email: action === "save_and_preview_email",
+    to_be_published_at: action === "save_and_schedule" ? scheduleDate : null,
+    publish: action === "save_and_publish",
+    save_action_name: action,
+  });
+
   const save = asyncVoid(async (action: SaveAction = "save") => {
     await Promise.resolve();
     if (!validate(action)) return;
 
-    const payload = {
-      installment: {
-        name: form.data.installment.name,
-        message: form.data.installment.message,
-        files: files.map((file, position) => ({
-          external_id: file.id,
-          position,
-          url: file.url,
-          stream_only: file.is_streamable && isStreamOnly,
-          subtitle_files: file.subtitle_files,
-        })),
-        link_id: productId,
-        published_at:
-          isPublished &&
-          publishDate !== toISODateString(installment.published_at) &&
-          action !== "save_and_schedule" &&
-          action !== "save_and_publish"
-            ? publishDate
-            : null,
-        shown_in_profile_sections: audienceType === "everyone" && channel.profile ? [...shownInProfileSections] : [],
-        ...filtersPayload,
-      },
-      variant_external_id: variantId,
-      send_preview_email: action === "save_and_preview_email",
-      to_be_published_at: action === "save_and_schedule" ? scheduleDate : null,
-      publish: action === "save_and_publish",
-      save_action_name: action,
-    };
-
-    form.transform(() => payload);
+    form.transform(() => buildPayload(action));
 
     if (installment?.external_id) {
       form.put(Routes.email_path(installment.external_id), { onFinish: () => finishPublishing() });
@@ -721,9 +760,58 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
     }
   });
 
+  const [isSendingSingleRecipient, setIsSendingSingleRecipient] = React.useState(false);
+  const validateSingleRecipientEmail = (message: string) => {
+    const invalidFieldNames = new Set<InvalidFieldName>();
+    const hasMessage = hasMessageContent(message);
+
+    if (form.data.installment.name.trim() === "") {
+      invalidFieldNames.add("title");
+      titleRef.current?.focus();
+      showAlert("Please set a title.", "error");
+    } else if (!hasMessage) {
+      showAlert("Please include a message as part of the update.", "error");
+    }
+
+    setInvalidFields(invalidFieldNames);
+    return invalidFieldNames.size === 0 && hasMessage;
+  };
+
+  const sendToSingleCustomer = asyncVoid(async () => {
+    if (!singleRecipient) return;
+
+    await Promise.resolve();
+    const message = getCurrentMessage();
+    if (!validateSingleRecipientEmail(message)) return;
+    form.setData("installment.message", message);
+
+    setIsSendingSingleRecipient(true);
+    try {
+      await sendSingleCustomerEmail(singleRecipient.purchaseId, {
+        name: form.data.installment.name,
+        message,
+        files: files.map((file, position) => ({
+          external_id: file.id,
+          position,
+          url: file.url,
+          stream_only: file.is_streamable && isStreamOnly,
+          subtitle_files: file.subtitle_files,
+        })),
+      });
+      showAlert("Email sent", "success");
+      router.visit(Routes.customer_sale_path(singleRecipient.purchaseId));
+    } catch (error) {
+      assertResponseError(error);
+      showAlert(error.message, "error");
+    } finally {
+      setIsSendingSingleRecipient(false);
+    }
+  });
+
   const isBusy =
     form.processing ||
     isPublishing ||
+    isSendingSingleRecipient ||
     imagesUploading.size > 0 ||
     files.some((file) => isFileUploading(file) || file.subtitle_files.some(isFileUploading));
 
@@ -737,126 +825,143 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
       <PageHeader
         title={installment?.external_id ? "Edit email" : "New email"}
         actions={
-          <>
-            {channel.email && channel.profile ? (
+          singleRecipient ? (
+            <>
+              <Button asChild>
+                <Link
+                  href={Routes.customer_sale_path(singleRecipient.purchaseId)}
+                  inert={isBusy ? true : undefined}
+                  className={isBusy ? "opacity-30" : undefined}
+                >
+                  Cancel
+                </Link>
+              </Button>
+              <Button color="accent" disabled={isBusy} onClick={sendToSingleCustomer}>
+                Send now
+              </Button>
+            </>
+          ) : (
+            <>
+              {channel.email && channel.profile ? (
+                <Popover>
+                  <PopoverAnchor>
+                    <PopoverTrigger disabled={isBusy} asChild>
+                      <Button>
+                        <Eye pack="filled" className="size-5" />
+                        Preview
+                        <ChevronDown className="size-5" />
+                      </Button>
+                    </PopoverTrigger>
+                  </PopoverAnchor>
+                  <PopoverContent sideOffset={4}>
+                    <div className="grid gap-3">
+                      <Button disabled={isBusy} onClick={() => save("save_and_preview_post")}>
+                        <FileDetail pack="filled" className="size-5" />
+                        Preview Post
+                      </Button>
+                      <Button disabled={isBusy} onClick={() => save("save_and_preview_email")}>
+                        <Envelope pack="filled" className="size-5" />
+                        Preview Email
+                      </Button>
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              ) : (
+                <Button
+                  disabled={isBusy}
+                  onClick={() => save(channel.profile ? "save_and_preview_post" : "save_and_preview_email")}
+                >
+                  <Eye pack="filled" className="size-5" />
+                  Preview
+                </Button>
+              )}
+              <Button asChild>
+                <Link
+                  href={getCancelPath()}
+                  inert={isBusy ? true : undefined}
+                  className={isBusy ? "opacity-30" : undefined}
+                >
+                  Cancel
+                </Link>
+              </Button>
               <Popover>
                 <PopoverAnchor>
                   <PopoverTrigger disabled={isBusy} asChild>
                     <Button>
-                      <Eye pack="filled" className="size-5" />
-                      Preview
+                      {channel.profile ? "Publish" : "Send"}
                       <ChevronDown className="size-5" />
                     </Button>
                   </PopoverTrigger>
                 </PopoverAnchor>
-                <PopoverContent sideOffset={4}>
+                <PopoverContent>
                   <div className="grid gap-3">
-                    <Button disabled={isBusy} onClick={() => save("save_and_preview_post")}>
-                      <FileDetail pack="filled" className="size-5" />
-                      Preview Post
-                    </Button>
-                    <Button disabled={isBusy} onClick={() => save("save_and_preview_email")}>
-                      <Envelope pack="filled" className="size-5" />
-                      Preview Email
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr max-content" }}>
+                      {isPublishing && secondsLeftToPublish > 0 ? (
+                        <>
+                          <Button color="accent" disabled>
+                            {channel.profile ? "Publishing" : "Sending"} in {secondsLeftToPublish}...
+                          </Button>
+                          <Button
+                            style={{ marginLeft: "var(--spacer-2)" }}
+                            onClick={() => {
+                              if (publishCountdownRef.current) {
+                                publishCountdownRef.current.abort();
+                                publishCountdownRef.current = null;
+                              }
+                              finishPublishing();
+                            }}
+                          >
+                            <X className="size-5" />
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          color="accent"
+                          onClick={() => {
+                            if (!validate("save_and_publish")) return;
+
+                            setIsPublishing(true);
+                            publishCountdownRef.current = new Countdown(
+                              DEFAULT_SECONDS_LEFT_TO_PUBLISH,
+                              (secondsLeft) => {
+                                setSecondsLeftToPublish(secondsLeft);
+                              },
+                              () => {
+                                publishCountdownRef.current = null;
+                                save("save_and_publish");
+                              },
+                            );
+                          }}
+                        >
+                          {channel.profile ? "Publish now" : "Send now"}
+                        </Button>
+                      )}
+                    </div>
+                    <Separator>OR</Separator>
+                    <Fieldset state={invalidFields.has("scheduleDate") ? "danger" : undefined}>
+                      <DateInput
+                        withTime
+                        aria-label="Schedule date"
+                        value={scheduleDate}
+                        min={new Date()}
+                        disabled={isPublished}
+                        onChange={(date) => {
+                          if (date) setScheduleDate(date);
+                          markFieldAsValid("scheduleDate");
+                        }}
+                      />
+                    </Fieldset>
+                    <Button disabled={isPublished || isBusy} onClick={() => save("save_and_schedule")}>
+                      Schedule
                     </Button>
                   </div>
                 </PopoverContent>
               </Popover>
-            ) : (
-              <Button
-                disabled={isBusy}
-                onClick={() => save(channel.profile ? "save_and_preview_post" : "save_and_preview_email")}
-              >
-                <Eye pack="filled" className="size-5" />
-                Preview
+              <Button color="accent" disabled={isBusy} onClick={() => save()}>
+                Save
               </Button>
-            )}
-            <Button asChild>
-              <Link
-                href={getCancelPath()}
-                inert={isBusy ? true : undefined}
-                className={isBusy ? "opacity-30" : undefined}
-              >
-                Cancel
-              </Link>
-            </Button>
-            <Popover>
-              <PopoverAnchor>
-                <PopoverTrigger disabled={isBusy} asChild>
-                  <Button>
-                    {channel.profile ? "Publish" : "Send"}
-                    <ChevronDown className="size-5" />
-                  </Button>
-                </PopoverTrigger>
-              </PopoverAnchor>
-              <PopoverContent>
-                <div className="grid gap-3">
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr max-content" }}>
-                    {isPublishing && secondsLeftToPublish > 0 ? (
-                      <>
-                        <Button color="accent" disabled>
-                          {channel.profile ? "Publishing" : "Sending"} in {secondsLeftToPublish}...
-                        </Button>
-                        <Button
-                          style={{ marginLeft: "var(--spacer-2)" }}
-                          onClick={() => {
-                            if (publishCountdownRef.current) {
-                              publishCountdownRef.current.abort();
-                              publishCountdownRef.current = null;
-                            }
-                            finishPublishing();
-                          }}
-                        >
-                          <X className="size-5" />
-                        </Button>
-                      </>
-                    ) : (
-                      <Button
-                        color="accent"
-                        onClick={() => {
-                          if (!validate("save_and_publish")) return;
-
-                          setIsPublishing(true);
-                          publishCountdownRef.current = new Countdown(
-                            DEFAULT_SECONDS_LEFT_TO_PUBLISH,
-                            (secondsLeft) => {
-                              setSecondsLeftToPublish(secondsLeft);
-                            },
-                            () => {
-                              publishCountdownRef.current = null;
-                              save("save_and_publish");
-                            },
-                          );
-                        }}
-                      >
-                        {channel.profile ? "Publish now" : "Send now"}
-                      </Button>
-                    )}
-                  </div>
-                  <Separator>OR</Separator>
-                  <Fieldset state={invalidFields.has("scheduleDate") ? "danger" : undefined}>
-                    <DateInput
-                      withTime
-                      aria-label="Schedule date"
-                      value={scheduleDate}
-                      min={new Date()}
-                      disabled={isPublished}
-                      onChange={(date) => {
-                        if (date) setScheduleDate(date);
-                        markFieldAsValid("scheduleDate");
-                      }}
-                    />
-                  </Fieldset>
-                  <Button disabled={isPublished || isBusy} onClick={() => save("save_and_schedule")}>
-                    Schedule
-                  </Button>
-                </div>
-              </PopoverContent>
-            </Popover>
-            <Button color="accent" disabled={isBusy} onClick={() => save()}>
-              Save
-            </Button>
-          </>
+            </>
+          )
         }
       />
       <section className="space-y-4 p-4 md:p-8">
@@ -864,376 +969,389 @@ export const EmailForm = ({ context, installment }: EmailFormProps) => {
 
         <div className="grid grid-cols-1 items-start gap-x-16 gap-y-8 lg:grid-cols-[var(--grid-cols-sidebar)]">
           <Card>
-            <CardContent>
-              <Fieldset className="grow basis-0" role="group">
-                <FieldsetTitle>
-                  <div>Audience</div>
-                  {hasAudience ? (
-                    recipientCount.loading ? (
-                      <div>
-                        <LoadingSpinner className="size-5" />
-                      </div>
-                    ) : (
-                      <div aria-label="Recipient count">{`${recipientCount.count.toLocaleString()} / ${recipientCount.total.toLocaleString()}`}</div>
-                    )
-                  ) : null}
-                </FieldsetTitle>
-                <Label htmlFor={`${uid}-recipient_everyone`} className="w-full">
-                  Everyone
-                  <Radio
-                    wrapperClassName="ml-auto"
-                    id={`${uid}-recipient_everyone`}
-                    checked={audienceType === "everyone"}
-                    disabled={isPublished}
-                    onChange={() => setAudienceType("everyone")}
-                  />
-                </Label>
-                {context.audience_types.includes("followers") ? (
-                  <Label htmlFor={`${uid}-recipient_followers_only`} className="w-full">
-                    Followers only
-                    <Radio
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-recipient_followers_only`}
-                      checked={audienceType === "followers"}
-                      disabled={isPublished}
-                      onChange={() => setAudienceType("followers")}
-                    />
-                  </Label>
-                ) : null}
-                {context.audience_types.includes("customers") ? (
-                  <Label htmlFor={`${uid}-recipient_customers_only`} className="w-full">
-                    Customers only
-                    <Radio
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-recipient_customers_only`}
-                      checked={audienceType === "customers"}
-                      disabled={isPublished}
-                      onChange={() => setAudienceType("customers")}
-                    />
-                  </Label>
-                ) : null}
-                {context.audience_types.includes("affiliates") ? (
-                  <Label htmlFor={`${uid}-recipient_affiliates_only`} className="w-full">
-                    Affiliates only
-                    <Radio
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-recipient_affiliates_only`}
-                      checked={audienceType === "affiliates"}
-                      disabled={isPublished}
-                      onChange={() => setAudienceType("affiliates")}
-                    />
-                  </Label>
-                ) : null}
-              </Fieldset>
-            </CardContent>
-            <CardContent>
-              <Fieldset
-                className="grow basis-0"
-                role="group"
-                state={invalidFields.has("channel") ? "danger" : undefined}
-              >
-                <FieldsetTitle>Channel</FieldsetTitle>
-                {hasAudience ? (
-                  <Label htmlFor={`${uid}-channel_email`} className="w-full">
-                    Send email
-                    <Checkbox
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-channel_email`}
-                      ref={sendEmailRef}
-                      checked={channel.email}
-                      disabled={!!(installment?.external_id && installment.has_been_blasted)}
-                      onChange={(event) => {
-                        setChannel((prev) => ({ ...prev, email: event.target.checked }));
-                        markFieldAsValid("channel");
-                      }}
-                    />
-                  </Label>
-                ) : null}
-                {audienceType === "everyone" ? (
-                  <Label htmlFor={`${uid}-channel_profile`} className="w-full">
-                    Post to profile
-                    <WithTooltip tip="This post will be visible to anyone who visits your profile." position="top">
-                      (?)
-                    </WithTooltip>
-                    <Checkbox
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-channel_profile`}
-                      checked={channel.profile}
-                      onChange={(event) => {
-                        setChannel((prev) => ({ ...prev, profile: event.target.checked }));
-                        markFieldAsValid("channel");
-                      }}
-                    />
-                  </Label>
-                ) : null}
-                {audienceType === "everyone" && channel.profile ? (
-                  context.profile_sections.length > 0 ? (
-                    <>
-                      {context.profile_sections.map((section) => (
-                        <Switch
-                          key={section.id}
-                          className="ml-auto"
-                          checked={shownInProfileSections.includes(section.id)}
-                          onChange={() => {
-                            setShownInProfileSections((prevSections) =>
-                              prevSections.includes(section.id)
-                                ? prevSections.filter((id) => id !== section.id)
-                                : [...prevSections, section.id],
-                            );
-                          }}
-                          label={section.name || "Unnamed section"}
+            {singleRecipient ? (
+              <CardContent>
+                <Fieldset className="grow basis-0">
+                  <FieldsetTitle>Recipient</FieldsetTitle>
+                  <div className="text-sm break-all">{singleRecipient.email}</div>
+                </Fieldset>
+              </CardContent>
+            ) : (
+              <>
+                <CardContent>
+                  <Fieldset className="grow basis-0" role="group">
+                    <FieldsetTitle>
+                      <div>Audience</div>
+                      {hasAudience ? (
+                        recipientCount.loading ? (
+                          <div>
+                            <LoadingSpinner className="size-5" />
+                          </div>
+                        ) : (
+                          <div aria-label="Recipient count">{`${recipientCount.count.toLocaleString()} / ${recipientCount.total.toLocaleString()}`}</div>
+                        )
+                      ) : null}
+                    </FieldsetTitle>
+                    <Label htmlFor={`${uid}-recipient_everyone`} className="w-full">
+                      Everyone
+                      <Radio
+                        wrapperClassName="ml-auto"
+                        id={`${uid}-recipient_everyone`}
+                        checked={audienceType === "everyone"}
+                        disabled={isPublished}
+                        onChange={() => setAudienceType("everyone")}
+                      />
+                    </Label>
+                    {context.audience_types.includes("followers") ? (
+                      <Label htmlFor={`${uid}-recipient_followers_only`} className="w-full">
+                        Followers only
+                        <Radio
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-recipient_followers_only`}
+                          checked={audienceType === "followers"}
+                          disabled={isPublished}
+                          onChange={() => setAudienceType("followers")}
                         />
-                      ))}
-                      {installment?.published_at ? null : (
+                      </Label>
+                    ) : null}
+                    {context.audience_types.includes("customers") ? (
+                      <Label htmlFor={`${uid}-recipient_customers_only`} className="w-full">
+                        Customers only
+                        <Radio
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-recipient_customers_only`}
+                          checked={audienceType === "customers"}
+                          disabled={isPublished}
+                          onChange={() => setAudienceType("customers")}
+                        />
+                      </Label>
+                    ) : null}
+                    {context.audience_types.includes("affiliates") ? (
+                      <Label htmlFor={`${uid}-recipient_affiliates_only`} className="w-full">
+                        Affiliates only
+                        <Radio
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-recipient_affiliates_only`}
+                          checked={audienceType === "affiliates"}
+                          disabled={isPublished}
+                          onChange={() => setAudienceType("affiliates")}
+                        />
+                      </Label>
+                    ) : null}
+                  </Fieldset>
+                </CardContent>
+                <CardContent>
+                  <Fieldset
+                    className="grow basis-0"
+                    role="group"
+                    state={invalidFields.has("channel") ? "danger" : undefined}
+                  >
+                    <FieldsetTitle>Channel</FieldsetTitle>
+                    {hasAudience ? (
+                      <Label htmlFor={`${uid}-channel_email`} className="w-full">
+                        Send email
+                        <Checkbox
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-channel_email`}
+                          ref={sendEmailRef}
+                          checked={channel.email}
+                          disabled={!!(installment?.external_id && installment.has_been_blasted)}
+                          onChange={(event) => {
+                            setChannel((prev) => ({ ...prev, email: event.target.checked }));
+                            markFieldAsValid("channel");
+                          }}
+                        />
+                      </Label>
+                    ) : null}
+                    {audienceType === "everyone" ? (
+                      <Label htmlFor={`${uid}-channel_profile`} className="w-full">
+                        Post to profile
+                        <WithTooltip tip="This post will be visible to anyone who visits your profile." position="top">
+                          (?)
+                        </WithTooltip>
+                        <Checkbox
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-channel_profile`}
+                          checked={channel.profile}
+                          onChange={(event) => {
+                            setChannel((prev) => ({ ...prev, profile: event.target.checked }));
+                            markFieldAsValid("channel");
+                          }}
+                        />
+                      </Label>
+                    ) : null}
+                    {audienceType === "everyone" && channel.profile ? (
+                      context.profile_sections.length > 0 ? (
+                        <>
+                          {context.profile_sections.map((section) => (
+                            <Switch
+                              key={section.id}
+                              className="ml-auto"
+                              checked={shownInProfileSections.includes(section.id)}
+                              onChange={() => {
+                                setShownInProfileSections((prevSections) =>
+                                  prevSections.includes(section.id)
+                                    ? prevSections.filter((id) => id !== section.id)
+                                    : [...prevSections, section.id],
+                                );
+                              }}
+                              label={section.name || "Unnamed section"}
+                            />
+                          ))}
+                          {installment?.published_at ? null : (
+                            <Alert role="status" variant="info">
+                              The post will be shown in the selected profile sections once it is published.
+                            </Alert>
+                          )}
+                        </>
+                      ) : (
                         <Alert role="status" variant="info">
-                          The post will be shown in the selected profile sections once it is published.
+                          You currently have no sections in your profile to display this,{" "}
+                          <a href={Routes.root_url({ host: currentSeller.subdomain })}>create one here</a>
                         </Alert>
-                      )}
-                    </>
-                  ) : (
-                    <Alert role="status" variant="info">
-                      You currently have no sections in your profile to display this,{" "}
-                      <a href={Routes.root_url({ host: currentSeller.subdomain })}>create one here</a>
-                    </Alert>
-                  )
+                      )
+                    ) : null}
+                  </Fieldset>
+                </CardContent>
+                {audienceType === "affiliates" ? (
+                  <CardContent>
+                    <Fieldset className="grow basis-0" role="group">
+                      <FieldsetTitle>Affiliated products</FieldsetTitle>
+                      <Label htmlFor={`${uid}-all_affiliated_products`} className="w-full">
+                        All products
+                        <Checkbox
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-all_affiliated_products`}
+                          checked={affiliatedProducts.length === affiliateProductOptions.length}
+                          disabled={isPublished}
+                          onChange={(event) =>
+                            setAffiliatedProducts(
+                              event.target.checked ? affiliateProductOptions.map(({ id }) => id) : [],
+                            )
+                          }
+                        />
+                      </Label>
+                      <TagInput
+                        inputId={`${uid}-affiliated_products_dropdown`}
+                        tagIds={affiliatedProducts}
+                        tagList={selectableProductOptions(affiliateProductOptions, affiliatedProducts)}
+                        onChangeTagIds={setAffiliatedProducts}
+                        isDisabled={isPublished}
+                      />
+                    </Fieldset>
+                  </CardContent>
                 ) : null}
-              </Fieldset>
-            </CardContent>
-            {audienceType === "affiliates" ? (
-              <CardContent>
-                <Fieldset className="grow basis-0" role="group">
-                  <FieldsetTitle>Affiliated products</FieldsetTitle>
-                  <Label htmlFor={`${uid}-all_affiliated_products`} className="w-full">
-                    All products
-                    <Checkbox
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-all_affiliated_products`}
-                      checked={affiliatedProducts.length === affiliateProductOptions.length}
-                      disabled={isPublished}
-                      onChange={(event) =>
-                        setAffiliatedProducts(event.target.checked ? affiliateProductOptions.map(({ id }) => id) : [])
-                      }
-                    />
-                  </Label>
-                  <TagInput
-                    inputId={`${uid}-affiliated_products_dropdown`}
-                    tagIds={affiliatedProducts}
-                    tagList={selectableProductOptions(affiliateProductOptions, affiliatedProducts)}
-                    onChangeTagIds={setAffiliatedProducts}
-                    isDisabled={isPublished}
-                  />
-                </Fieldset>
-              </CardContent>
-            ) : null}
-            {audienceType === "customers" || audienceType === "followers" ? (
-              <CardContent>
-                <Fieldset className="grow basis-0">
-                  <FieldsetTitle>
-                    <Label htmlFor={`${uid}-bought`}>Bought</Label>
-                  </FieldsetTitle>
-                  <TagInput
-                    inputId={`${uid}-bought`}
-                    tagIds={bought}
-                    tagList={selectableProductOptions(productOptions, bought)}
-                    onChangeTagIds={setBought}
-                    isDisabled={isPublished}
-                  />
-                </Fieldset>
-              </CardContent>
-            ) : null}
-            {hasAudience && audienceType !== "affiliates" ? (
-              <CardContent>
-                <Fieldset className="grow basis-0">
-                  <FieldsetTitle>
-                    <Label htmlFor={`${uid}-not_bought`}>Has not yet bought</Label>
-                  </FieldsetTitle>
-                  <TagInput
-                    inputId={`${uid}-not_bought`}
-                    tagIds={notBought}
-                    tagList={selectableProductOptions(productOptions, notBought)}
-                    onChangeTagIds={setNotBought}
-                    isDisabled={isPublished}
-                    // Displayed as a multi-select for consistency, but supports only one option for now
-                    maxTags={1}
-                  />
-                </Fieldset>
-              </CardContent>
-            ) : null}
-            {audienceType === "customers" ? (
-              <CardContent>
-                <div
-                  style={{
-                    display: "grid",
-                    gap: "var(--spacer-4)",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
-                  }}
-                  className="grow"
-                >
-                  <Fieldset state={invalidFields.has("paidMoreThan") ? "danger" : undefined}>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-paid_more_than`}>Paid more than</Label>
-                    </FieldsetTitle>
-                    <PriceInput
-                      id={`${uid}-paid_more_than`}
-                      ref={paidMoreThanRef}
-                      currencyCode={context.currency_type}
-                      cents={paidMoreThanCents}
-                      disabled={isPublished}
-                      onChange={(cents) => {
-                        setPaidMoreThanCents(cents);
-                        markFieldAsValid("paidMoreThan");
-                        markFieldAsValid("paidLessThan");
+                {audienceType === "customers" || audienceType === "followers" ? (
+                  <CardContent>
+                    <Fieldset className="grow basis-0">
+                      <FieldsetTitle>
+                        <Label htmlFor={`${uid}-bought`}>Bought</Label>
+                      </FieldsetTitle>
+                      <TagInput
+                        inputId={`${uid}-bought`}
+                        tagIds={bought}
+                        tagList={selectableProductOptions(productOptions, bought)}
+                        onChangeTagIds={setBought}
+                        isDisabled={isPublished}
+                      />
+                    </Fieldset>
+                  </CardContent>
+                ) : null}
+                {hasAudience && audienceType !== "affiliates" ? (
+                  <CardContent>
+                    <Fieldset className="grow basis-0">
+                      <FieldsetTitle>
+                        <Label htmlFor={`${uid}-not_bought`}>Has not yet bought</Label>
+                      </FieldsetTitle>
+                      <TagInput
+                        inputId={`${uid}-not_bought`}
+                        tagIds={notBought}
+                        tagList={selectableProductOptions(productOptions, notBought)}
+                        onChangeTagIds={setNotBought}
+                        isDisabled={isPublished}
+                        // Displayed as a multi-select for consistency, but supports only one option for now
+                        maxTags={1}
+                      />
+                    </Fieldset>
+                  </CardContent>
+                ) : null}
+                {audienceType === "customers" ? (
+                  <CardContent>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: "var(--spacer-4)",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
                       }}
-                      placeholder="0"
-                    />
-                  </Fieldset>
-                  <Fieldset state={invalidFields.has("paidLessThan") ? "danger" : undefined}>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-paid_less_than`}>Paid less than</Label>
-                    </FieldsetTitle>
-                    <PriceInput
-                      id={`${uid}-paid_less_than`}
-                      currencyCode={context.currency_type}
-                      cents={paidLessThanCents}
-                      disabled={isPublished}
-                      onChange={(cents) => {
-                        setPaidLessThanCents(cents);
-                        markFieldAsValid("paidMoreThan");
-                        markFieldAsValid("paidLessThan");
-                      }}
-                      placeholder="∞"
-                    />
-                  </Fieldset>
-                </div>
-              </CardContent>
-            ) : null}
-            {hasAudience ? (
-              <CardContent>
-                <div
-                  style={{
-                    display: "grid",
-                    gap: "var(--spacer-4)",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
-                  }}
-                  className="grow"
-                >
-                  <Fieldset state={invalidFields.has("afterDate") ? "danger" : undefined}>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-after_date`}>After</Label>
-                    </FieldsetTitle>
-                    <Input
-                      type="date"
-                      id={`${uid}-after_date`}
-                      ref={afterDateRef}
-                      value={afterDate}
-                      disabled={isPublished}
-                      onChange={(event) => {
-                        setAfterDate(event.target.value);
-                        markFieldAsValid("afterDate");
-                        markFieldAsValid("beforeDate");
-                      }}
-                    />
-                    <FieldsetDescription>00:00 {context.timezone}</FieldsetDescription>
-                  </Fieldset>
-                  <Fieldset state={invalidFields.has("beforeDate") ? "danger" : undefined}>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-before_date`}>Before</Label>
-                    </FieldsetTitle>
-                    <Input
-                      type="date"
-                      id={`${uid}-before_date`}
-                      value={beforeDate}
-                      disabled={isPublished}
-                      onChange={(event) => {
-                        setBeforeDate(event.target.value);
-                        markFieldAsValid("beforeDate");
-                        markFieldAsValid("afterDate");
-                      }}
-                    />
-                    <FieldsetDescription>11:59 {context.timezone}</FieldsetDescription>
-                  </Fieldset>
-                </div>
-              </CardContent>
-            ) : null}
-            {audienceType === "customers" ? (
-              <CardContent>
-                <div
-                  style={{
-                    display: "grid",
-                    gap: "var(--spacer-4)",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
-                  }}
-                  className="grow"
-                >
-                  <Fieldset>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-from_country`}>From</Label>
-                    </FieldsetTitle>
-                    <Select
-                      id={`${uid}-from_country`}
-                      value={fromCountry}
-                      disabled={isPublished}
-                      onChange={(event) => setFromCountry(event.target.value)}
+                      className="grow"
                     >
-                      <option value="">Anywhere</option>
-                      {context.countries.map((country) => (
-                        <option key={country} value={country}>
-                          {country}
-                        </option>
-                      ))}
-                    </Select>
-                  </Fieldset>
-                  <Fieldset>
-                    <FieldsetTitle>
-                      <Label htmlFor={`${uid}-minimum_license_uses`}>Minimum license uses</Label>
-                    </FieldsetTitle>
-                    <Input
-                      id={`${uid}-minimum_license_uses`}
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={minimumLicenseUses ?? ""}
-                      disabled={isPublished}
-                      onChange={(event) => {
-                        const parsed = Number.parseInt(event.target.value, 10);
-                        setMinimumLicenseUses(Number.isNaN(parsed) || parsed <= 0 ? null : parsed);
+                      <Fieldset state={invalidFields.has("paidMoreThan") ? "danger" : undefined}>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-paid_more_than`}>Paid more than</Label>
+                        </FieldsetTitle>
+                        <PriceInput
+                          id={`${uid}-paid_more_than`}
+                          ref={paidMoreThanRef}
+                          currencyCode={context.currency_type}
+                          cents={paidMoreThanCents}
+                          disabled={isPublished}
+                          onChange={(cents) => {
+                            setPaidMoreThanCents(cents);
+                            markFieldAsValid("paidMoreThan");
+                            markFieldAsValid("paidLessThan");
+                          }}
+                          placeholder="0"
+                        />
+                      </Fieldset>
+                      <Fieldset state={invalidFields.has("paidLessThan") ? "danger" : undefined}>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-paid_less_than`}>Paid less than</Label>
+                        </FieldsetTitle>
+                        <PriceInput
+                          id={`${uid}-paid_less_than`}
+                          currencyCode={context.currency_type}
+                          cents={paidLessThanCents}
+                          disabled={isPublished}
+                          onChange={(cents) => {
+                            setPaidLessThanCents(cents);
+                            markFieldAsValid("paidMoreThan");
+                            markFieldAsValid("paidLessThan");
+                          }}
+                          placeholder="∞"
+                        />
+                      </Fieldset>
+                    </div>
+                  </CardContent>
+                ) : null}
+                {hasAudience ? (
+                  <CardContent>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: "var(--spacer-4)",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
                       }}
-                      placeholder="1"
-                    />
+                      className="grow"
+                    >
+                      <Fieldset state={invalidFields.has("afterDate") ? "danger" : undefined}>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-after_date`}>After</Label>
+                        </FieldsetTitle>
+                        <Input
+                          type="date"
+                          id={`${uid}-after_date`}
+                          ref={afterDateRef}
+                          value={afterDate}
+                          disabled={isPublished}
+                          onChange={(event) => {
+                            setAfterDate(event.target.value);
+                            markFieldAsValid("afterDate");
+                            markFieldAsValid("beforeDate");
+                          }}
+                        />
+                        <FieldsetDescription>00:00 {context.timezone}</FieldsetDescription>
+                      </Fieldset>
+                      <Fieldset state={invalidFields.has("beforeDate") ? "danger" : undefined}>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-before_date`}>Before</Label>
+                        </FieldsetTitle>
+                        <Input
+                          type="date"
+                          id={`${uid}-before_date`}
+                          value={beforeDate}
+                          disabled={isPublished}
+                          onChange={(event) => {
+                            setBeforeDate(event.target.value);
+                            markFieldAsValid("beforeDate");
+                            markFieldAsValid("afterDate");
+                          }}
+                        />
+                        <FieldsetDescription>11:59 {context.timezone}</FieldsetDescription>
+                      </Fieldset>
+                    </div>
+                  </CardContent>
+                ) : null}
+                {audienceType === "customers" ? (
+                  <CardContent>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: "var(--spacer-4)",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(var(--dynamic-grid), 1fr))",
+                      }}
+                      className="grow"
+                    >
+                      <Fieldset>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-from_country`}>From</Label>
+                        </FieldsetTitle>
+                        <Select
+                          id={`${uid}-from_country`}
+                          value={fromCountry}
+                          disabled={isPublished}
+                          onChange={(event) => setFromCountry(event.target.value)}
+                        >
+                          <option value="">Anywhere</option>
+                          {context.countries.map((country) => (
+                            <option key={country} value={country}>
+                              {country}
+                            </option>
+                          ))}
+                        </Select>
+                      </Fieldset>
+                      <Fieldset>
+                        <FieldsetTitle>
+                          <Label htmlFor={`${uid}-minimum_license_uses`}>Minimum license uses</Label>
+                        </FieldsetTitle>
+                        <Input
+                          id={`${uid}-minimum_license_uses`}
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={minimumLicenseUses ?? ""}
+                          disabled={isPublished}
+                          onChange={(event) => {
+                            const parsed = Number.parseInt(event.target.value, 10);
+                            setMinimumLicenseUses(Number.isNaN(parsed) || parsed <= 0 ? null : parsed);
+                          }}
+                          placeholder="1"
+                        />
+                      </Fieldset>
+                    </div>
+                  </CardContent>
+                ) : null}
+                {audienceType === "customers" ? (
+                  <CardContent>
+                    <Fieldset className="grow basis-0" role="group">
+                      <Label htmlFor={`${uid}-active_customers_only`} className="w-full">
+                        Active customers only
+                        <Checkbox
+                          wrapperClassName="ml-auto"
+                          id={`${uid}-active_customers_only`}
+                          checked={activeCustomersOnly}
+                          disabled={isPublished}
+                          onChange={(event) => setActiveCustomersOnly(event.target.checked)}
+                        />
+                      </Label>
+                    </Fieldset>
+                  </CardContent>
+                ) : null}
+                <CardContent>
+                  <Fieldset className="grow basis-0" role="group">
+                    <FieldsetTitle>Engagement</FieldsetTitle>
+                    <Label htmlFor={`${uid}-allow_comments`} className="w-full">
+                      Allow comments
+                      <Checkbox
+                        wrapperClassName="ml-auto"
+                        id={`${uid}-allow_comments`}
+                        checked={allowComments}
+                        onChange={(event) => setAllowComments(event.target.checked)}
+                      />
+                    </Label>
                   </Fieldset>
-                </div>
-              </CardContent>
-            ) : null}
-            {audienceType === "customers" ? (
-              <CardContent>
-                <Fieldset className="grow basis-0" role="group">
-                  <Label htmlFor={`${uid}-active_customers_only`} className="w-full">
-                    Active customers only
-                    <Checkbox
-                      wrapperClassName="ml-auto"
-                      id={`${uid}-active_customers_only`}
-                      checked={activeCustomersOnly}
-                      disabled={isPublished}
-                      onChange={(event) => setActiveCustomersOnly(event.target.checked)}
-                    />
-                  </Label>
-                </Fieldset>
-              </CardContent>
-            ) : null}
-            <CardContent>
-              <Fieldset className="grow basis-0" role="group">
-                <FieldsetTitle>Engagement</FieldsetTitle>
-                <Label htmlFor={`${uid}-allow_comments`} className="w-full">
-                  Allow comments
-                  <Checkbox
-                    wrapperClassName="ml-auto"
-                    id={`${uid}-allow_comments`}
-                    checked={allowComments}
-                    onChange={(event) => setAllowComments(event.target.checked)}
-                  />
-                </Label>
-              </Fieldset>
-            </CardContent>
+                </CardContent>
+              </>
+            )}
           </Card>
           <S3UploadConfigProvider value={s3UploadConfig}>
             <EvaporateUploaderProvider value={evaporateUploader}>

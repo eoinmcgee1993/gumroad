@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUpRightSquare, Paperclip, Trash } from "@boxicons/react";
+import { ArrowDown, ArrowUpRightSquare, Envelope, Paperclip, Trash } from "@boxicons/react";
 import { Deferred, Link } from "@inertiajs/react";
 import { Blob, DirectUpload } from "@rails/activestorage";
 import * as React from "react";
@@ -85,6 +85,7 @@ export type CustomerDetailPageProps = {
   customer: Customer;
   countries: string[];
   can_ping: boolean;
+  can_email: boolean;
   show_refund_fee_notice: boolean;
   emails: CustomerEmail[];
   missed_posts?: MissedPost[];
@@ -130,6 +131,7 @@ const CustomerDetailPage = ({
   customer: initialCustomer,
   countries,
   can_ping: canPing,
+  can_email: canEmail,
   show_refund_fee_notice: showRefundFeeNotice,
   emails: initialEmails,
   missed_posts: initialMissedPosts,
@@ -177,6 +179,8 @@ const CustomerDetailPage = ({
   const [charges, setCharges] = React.useState<Charge[]>(initialCharges);
 
   const isCoffee = customer.product.native_type === "coffee";
+  const canEmailCustomer =
+    canEmail && isValidEmail(customer.email) && customer.can_contact && !customer.is_gift_sender_purchase;
 
   const formatDateWithoutTime = (date: Date) =>
     date.toLocaleDateString(userAgentInfo.locale, {
@@ -231,6 +235,20 @@ const CustomerDetailPage = ({
             {customer.product.name}
             {statusPills}
           </div>
+        }
+        actions={
+          canEmailCustomer ? (
+            <NavigationButton
+              color="accent"
+              href={Routes.new_email_path({
+                template: "single_customer",
+                purchase_id: customer.id,
+              })}
+            >
+              <Envelope aria-hidden="true" className="size-5" />
+              Email customer
+            </NavigationButton>
+          ) : null
         }
       />
 

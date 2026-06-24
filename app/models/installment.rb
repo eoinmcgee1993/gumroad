@@ -58,6 +58,7 @@ class Installment < ApplicationRecord
   }.freeze
 
   attr_json_data_accessor :workflow_trigger
+  attr_json_data_accessor :single_recipient_purchase_id
 
   belongs_to :link, optional: true
   belongs_to :base_variant, optional: true
@@ -94,6 +95,7 @@ class Installment < ApplicationRecord
             9 => :send_emails,
             10 => :ready_to_publish,
             11 => :allow_comments,
+            12 => :single_recipient_email,
             :column => "flags",
             :flag_query_mode => :bit_operator,
             check_for_column: false
@@ -131,10 +133,10 @@ class Installment < ApplicationRecord
   }
 
   scope :missed_for_purchase, -> (purchase) {
-    product_installment_ids = purchase.link.installments.where(seller_id: purchase.seller_id).alive.published.filter_map do |post|
+    product_installment_ids = purchase.link.installments.where(seller_id: purchase.seller_id).alive.published.not_single_recipient_email.filter_map do |post|
       post.id if post.purchase_passes_filters(purchase)
     end
-    seller_installment_ids = purchase.seller.installments.alive.published.filter_map do |post|
+    seller_installment_ids = purchase.seller.installments.alive.published.not_single_recipient_email.filter_map do |post|
       post.id if post.purchase_passes_filters(purchase)
     end
 
@@ -248,9 +250,9 @@ class Installment < ApplicationRecord
 
   scope :emailable_posts_for_purchase, ->(purchase:) do
     subqueries = [
-      for_products(product_ids: [purchase.link_id]).send_emails,
-      for_variants(variant_ids: purchase.variant_attributes.pluck(:id)).send_emails,
-      seller_posts_for_sellers(seller_ids: [purchase.seller_id]).send_emails,
+      for_products(product_ids: [purchase.link_id]).send_emails.not_single_recipient_email,
+      for_variants(variant_ids: purchase.variant_attributes.pluck(:id)).send_emails.not_single_recipient_email,
+      seller_posts_for_sellers(seller_ids: [purchase.seller_id]).send_emails.not_single_recipient_email,
     ]
     subqueries_sqls = subqueries.map { "(" + _1.to_sql + ")" }
     from("(" + subqueries_sqls.join(" UNION ") + ") AS #{table_name}")
@@ -570,6 +572,15 @@ class Installment < ApplicationRecord
     UrlRedirect.where(purchase_id: purchase.id, installment_id: id).first if purchase
   end
 
+  # The content link to deliver this post to a purchase: an (installment, purchase)
+  # redirect when the post carries its own files, otherwise the purchase's existing
+  # product download.
+  def delivery_url_redirect_for(purchase)
+    return purchase.url_redirect unless has_files?
+
+    purchase_url_redirect(purchase) || generate_url_redirect_for_purchase(purchase)
+  end
+
   def imported_customer_url_redirect(imported_customer)
     UrlRedirect.where(imported_customer_id: imported_customer.id, installment_id: id).last
   end
@@ -832,6 +843,8 @@ class Installment < ApplicationRecord
     return nil if user.blank? || !needs_purchase_to_access_content?
 
     purchases = user.purchases.successful_or_preorder_authorization_successful_and_not_refunded_or_chargedback
+    return purchases.find_by(id: single_recipient_purchase_id) if single_recipient_email?
+
     purchases = if installment_type == PRODUCT_TYPE
       purchases.where(link_id:)
     elsif installment_type == VARIANT_TYPE
@@ -846,6 +859,10 @@ class Installment < ApplicationRecord
   def eligible_purchase?(purchase)
     return true unless needs_purchase_to_access_content?
     return false if purchase.nil?
+    # A one-off email is a seller-type post with no audience filters, which would
+    # otherwise be viewable by any of the seller's customers. Restrict it to the
+    # single purchase it was created for (a durable marker, not delivery telemetry).
+    return false if single_recipient_email? && single_recipient_purchase_id.to_i != purchase.id
 
     is_purchase_relevant = if product_type?
       purchase.link_id == link_id
@@ -919,7 +936,7 @@ class Installment < ApplicationRecord
     product_permalink = product.unique_permalink
     product_variant_external_ids = product.alive_variants.map(&:external_id)
 
-    posts = self.includes(:installment_rule, :seller).alive.published.where(seller_id: product.user_id).filter do |post|
+    posts = self.includes(:installment_rule, :seller).alive.published.not_single_recipient_email.where(seller_id: product.user_id).filter do |post|
       post.seller_or_product_or_variant_type? && (
         (post.bought_products.present? && post.bought_products.include?(product_permalink)) ||
         (post.bought_variants.present? && post.bought_variants.any? { product_variant_external_ids.include?(_1) }) ||
@@ -1028,6 +1045,7 @@ class Installment < ApplicationRecord
       return unless send_emails
       return if deleted_at.present?
       return if abandoned_cart_type?
+      return if single_recipient_email?
 
       if audience_members_count(SENDING_LIMIT + 1) > SENDING_LIMIT && user.sales_cents_total < MINIMUM_SALES_CENTS_VALUE
         errors.add(:base, "<a href='/help/article/269-balance-page' target='_blank' rel='noreferrer'>Sorry, you cannot send out more than #{SENDING_LIMIT} emails until you have $#{MINIMUM_SALES_CENTS_VALUE / 100} in total earnings.</a>".html_safe)
