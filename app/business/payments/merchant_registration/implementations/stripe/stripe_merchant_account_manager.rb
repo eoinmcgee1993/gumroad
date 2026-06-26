@@ -110,7 +110,7 @@ module StripeMerchantAccountManager
       )
     end
 
-    stripe_account = Stripe::Account.create(account_params)
+    stripe_account = Stripe::Account.create(force_utf8_encoding(account_params))
 
     merchant_account.charge_processor_merchant_id = stripe_account.id
     merchant_account.save!
@@ -118,7 +118,7 @@ module StripeMerchantAccountManager
     if user_compliance_info.is_business?
       person_params = person_hash(user_compliance_info, passphrase)
       person_params.deep_merge!(relationship: { representative: true, owner: true, title: user_compliance_info.job_title.presence || DEFAULT_RELATIONSHIP_TITLE, percent_ownership: 100 })
-      Stripe::Account.create_person(stripe_account.id, person_params)
+      Stripe::Account.create_person(stripe_account.id, force_utf8_encoding(person_params))
     end
 
     # We need to update with empty full_name_aliases here as setting full_name_aliases is mandatory for Singapore accounts.
@@ -256,7 +256,7 @@ module StripeMerchantAccountManager
       force_address_into_diff!(diff_attributes, current_attributes, entity_key)
     end
 
-    Stripe::Account.update(stripe_account.id, diff_attributes)
+    Stripe::Account.update(stripe_account.id, force_utf8_encoding(diff_attributes))
 
     person_address_submitted = false
     if user_compliance_info.is_business?
@@ -306,7 +306,7 @@ module StripeMerchantAccountManager
     # actually re-validates a previously rejected representative postal code.
     force_address_into_diff!(diff_attributes, { person: current_attributes }, :person) if force_address_resync
 
-    Stripe::Account.update_person(stripe_account.id, stripe_person.id, diff_attributes)
+    Stripe::Account.update_person(stripe_account.id, stripe_person.id, force_utf8_encoding(diff_attributes))
     ADDRESS_SUBHASH_KEYS.any? { |address_key| diff_attributes[address_key].present? }
   end
 
@@ -369,7 +369,7 @@ module StripeMerchantAccountManager
     end
 
     attributes = bank_account_hash(bank_account, stripe_account:, passphrase:)
-    Stripe::Account.update(stripe_account.id, attributes)
+    Stripe::Account.update(stripe_account.id, force_utf8_encoding(attributes))
 
     save_stripe_bank_account_info(bank_account, stripe_account.refresh)
     clear_stale_bank_sync_failure_notes(user)
@@ -508,6 +508,27 @@ module StripeMerchantAccountManager
       end
     end
     merchant_account.mark_deleted!
+  end
+
+  # Strongbox decrypts (account number, tax ids) return ASCII-8BIT (binary) strings. When the
+  # Stripe gem serializes the params it concatenates them with the other UTF-8 fields; if a
+  # compliance field carries non-ASCII bytes (e.g. an umlaut/accent in a business name or address:
+  # "Häuserhelden", "Düsseldorf"), Ruby raises Encoding::CompatibilityError ("incompatible character
+  # encodings: UTF-8 and BINARY (ASCII-8BIT)") and the Stripe::Account.create/create_person call
+  # never reaches Stripe — silently blocking the seller from getting a merchant account (gh-private
+  # #683). IBANs and tax ids are pure-ASCII bytes, so relabeling them UTF-8 is lossless. Recursively
+  # re-encode every ASCII-8BIT string in the params to UTF-8 right before the Stripe API call.
+  def self.force_utf8_encoding(value)
+    case value
+    when Hash
+      value.transform_values { |v| force_utf8_encoding(v) }
+    when Array
+      value.map { |v| force_utf8_encoding(v) }
+    when String
+      value.encoding == Encoding::ASCII_8BIT ? value.dup.force_encoding(Encoding::UTF_8) : value
+    else
+      value
+    end
   end
 
   private_class_method
