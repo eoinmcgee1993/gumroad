@@ -32,6 +32,7 @@ import { computeInitialCheckout, type InitialCheckout } from "$app/components/Ch
 import {
   computeTip,
   computeTipForPrice,
+  type CheckoutPaymentConfig,
   createReducer,
   getCustomFieldKey,
   getTotalPriceFromProducts,
@@ -77,6 +78,7 @@ type CheckoutIndexPageProps = {
     state: string | null;
     tip_options: number[];
     us_states: string[];
+    checkout_payment: CheckoutPaymentConfig;
   };
 };
 
@@ -114,6 +116,7 @@ const CheckoutIndexPage = () => {
       cart_save_debounce_ms,
       tip_options,
       default_tip_option,
+      checkout_payment,
     },
     ...props
   } = typia.assert<CheckoutIndexPageProps>(usePage().props);
@@ -170,6 +173,7 @@ const CheckoutIndexPage = () => {
     paypalClientId: paypal_client_id,
     gift,
     requireEmailTypoAcknowledgment: require_email_typo_acknowledgment,
+    checkoutPayment: checkout_payment,
   });
   const [state, dispatch] = reducer;
   const [results, setResults] = React.useState<Result[] | null>(null);
@@ -289,8 +293,10 @@ const CheckoutIndexPage = () => {
         quantity: item.quantity,
         hasFreeTrial: !!item.product.free_trial,
         hasTippingEnabled: item.product.has_tipping_enabled,
+        isPreorder: item.product.is_preorder,
         price: convertToUSD(item, price),
         payInInstallments: item.pay_in_installments,
+        recurrence: item.recurrence,
         recommended_by: item.recommended_by,
         shippableCountryCodes: item.product.shippable_country_codes,
         nativeType: item.product.native_type,
