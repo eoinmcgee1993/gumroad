@@ -316,6 +316,9 @@ Rails.application.routes.draw do
             get :products
           end
         end
+        get "/agent/meta", to: "agent#meta"
+        post "/agent/messages", to: "agent#create"
+        post "/agent/actions", to: "agent#execute"
         resources :devices, only: :create
         resources :installments, only: :show
         resources :consumption_analytics, only: [:create], format: :json
@@ -962,6 +965,9 @@ Rails.application.routes.draw do
     get "/product_files_utility/product_files/:product_id", to: "product_files_utility#download_product_files", as: :download_product_files
     get "/product_files_utility/folder_archive/:folder_id", to: "product_files_utility#download_folder_archive", as: :download_folder_archive
 
+    # agent (conversational store assistant)
+    get "/agent", to: "agent#index", as: :agent
+
     # analytics
     get "/analytics" => redirect("/dashboard/sales")
     get "/dashboard/sales", to: "analytics#index", as: :sales_dashboard
@@ -1136,6 +1142,11 @@ Rails.application.routes.draw do
         end
 
         resources :ai_product_details_generations, only: [:create]
+
+        # Conversational store agent
+        post "/agent/messages", to: "agent_messages#create", as: :agent_messages
+        post "/agent/messages/stream", to: "agent_message_streams#create", as: :agent_messages_stream
+        post "/agent/actions", to: "agent_messages#execute", as: :agent_actions
       end
     end
 
