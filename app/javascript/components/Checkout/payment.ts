@@ -39,6 +39,7 @@ export type PaymentElementConfig = {
   currency: "usd";
   payment_method_types: ["card"];
   payment_method_creation: "manual";
+  stripe_link_enabled: boolean;
 };
 export type CheckoutPaymentConfig =
   | {
