@@ -189,6 +189,59 @@ describe Checkout::StripePaymentPresenter do
       .to eq(card_element_fallback("setup_or_installment_flow"))
   end
 
+  it "falls back to CardElement when the charged checkout total is below the Payment Element minimum" do
+    expect(
+      stripe_payment_props(
+        add_products: [flagged_seller_product(price: described_class::STRIPE_PAYMENT_ELEMENT_MINIMUM_USD_CHARGE_CENTS - 1)]
+      )
+    )
+      .to eq(card_element_fallback("stripe_payment_element_amount_below_minimum"))
+  end
+
+  it "selects Stripe Payment Element when the charged checkout total is below Gumroad's USD minimum but chargeable by Stripe" do
+    gumroad_minimum_price_cents = CURRENCY_CHOICES[Currency::USD][:min_price]
+
+    expect(
+      stripe_payment_props(
+        add_products: [flagged_seller_product(price: gumroad_minimum_price_cents - 1)]
+      )
+    ).to eq(payment_element_props)
+  end
+
+  it "selects Stripe Payment Element for mixed free and paid products when the charged total meets the minimum" do
+    seller = create(:user)
+    minimum_charge_cents = described_class::STRIPE_PAYMENT_ELEMENT_MINIMUM_USD_CHARGE_CENTS
+    free_product = create(:product, user: seller, price_cents: 0)
+    paid_product = create(:product, user: seller, price_cents: CURRENCY_CHOICES[Currency::USD][:min_price])
+    Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CHECKOUT_FEATURE_NAME, seller)
+
+    expect(
+      stripe_payment_props(
+        add_products: [
+          checkout_product_for(free_product, price: 0),
+          checkout_product_for(paid_product, price: minimum_charge_cents),
+        ]
+      )
+    ).to eq(payment_element_props)
+  end
+
+  it "falls back to CardElement for mixed free and paid products when the charged total is below the minimum" do
+    seller = create(:user)
+    minimum_price_cents = described_class::STRIPE_PAYMENT_ELEMENT_MINIMUM_USD_CHARGE_CENTS
+    free_product = create(:product, user: seller, price_cents: 0)
+    paid_product = create(:product, user: seller, price_cents: CURRENCY_CHOICES[Currency::USD][:min_price])
+    Feature.activate_user(described_class::STRIPE_PAYMENT_ELEMENT_CHECKOUT_FEATURE_NAME, seller)
+
+    expect(
+      stripe_payment_props(
+        add_products: [
+          checkout_product_for(free_product, price: 0),
+          checkout_product_for(paid_product, price: minimum_price_cents - 1),
+        ]
+      )
+    ).to eq(card_element_fallback("stripe_payment_element_amount_below_minimum"))
+  end
+
   it "ignores cart products when clear_cart is set" do
     cart = create(:cart, :guest)
     create(:cart_product, cart:, product: create(:product, user: create(:user)))
