@@ -157,7 +157,7 @@ class Order::PreparePaymentIntentService
     def build_charge
       charge = order.charges.create!(seller:)
       charge.update!(merchant_account:, processor: merchant_account.charge_processor_id,
-                     amount_cents:, gumroad_amount_cents:)
+                     amount_cents:, gumroad_amount_cents:, client_confirmed: true)
       # Add the seller's already-successful free/test purchases alongside the paid ones, so
       # finalize's send_charge_receipts covers them (Order::ChargeService assigns every purchase in
       # a seller group to its charge). Scoped to this charge's seller so a free item from another
