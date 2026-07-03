@@ -81,6 +81,7 @@ export type OfferCode = {
   name: string;
   code: string;
   products: Product[] | null;
+  excluded_products: Product[];
   discount: { type: "cents" | "percent"; value: number };
   limit: number | null;
   currency_type: CurrencyCode;
@@ -101,15 +102,22 @@ export type QueryParams = {
   page: number | null;
 };
 
-const formatProducts = (offerCode: OfferCode) => {
-  if (!offerCode.products) return "all products";
-  const products = offerCode.products
+const formatProductNames = (products: Product[]) => {
+  const names = products
     .slice(0, 2)
     .map(({ name }) => name)
     .join(", ");
-  return offerCode.products.length > 2
-    ? `${products}, and ${offerCode.products.length - 2} ${offerCode.products.length - 2 === 1 ? "other" : "others"}`
-    : products;
+  return products.length > 2
+    ? `${names}, and ${products.length - 2} ${products.length - 2 === 1 ? "other" : "others"}`
+    : names;
+};
+const formatProducts = (offerCode: OfferCode) => {
+  if (!offerCode.products) {
+    return offerCode.excluded_products.length > 0
+      ? `all products except ${formatProductNames(offerCode.excluded_products)}`
+      : "all products";
+  }
+  return formatProductNames(offerCode.products);
 };
 const formatAmount = (offerCode: OfferCode) => {
   if (offerCode.ownership_duration_tiers?.length) {
@@ -627,6 +635,20 @@ const DiscountsPage = ({
                 </section>
               </Card>
             ) : null}
+            {selectedOfferCode.excluded_products.length > 0 ? (
+              <Card asChild>
+                <section>
+                  <CardContent asChild>
+                    <h3>Excluded products</h3>
+                  </CardContent>
+                  {selectedOfferCode.excluded_products.map((product) => (
+                    <CardContent key={product.id}>
+                      <h5 className="font-bold">{product.name}</h5>
+                    </CardContent>
+                  ))}
+                </section>
+              </Card>
+            ) : null}
             <section className="grid auto-cols-fr grid-flow-row gap-4 sm:grid-flow-col">
               <Button onClick={() => setView("create")} disabled={!selectedOfferCode.can_update || isLoading}>
                 Duplicate
@@ -676,6 +698,7 @@ const DiscountsPage = ({
             maxQuantity: offerCode.limit,
             discount: offerCode.discount,
             selectedProductIds: offerCode.products?.map(({ id }) => id) ?? [],
+            excludedProductIds: offerCode.excluded_products.map(({ id }) => id),
             currencyCode: offerCode.discount.type === "cents" ? offerCode.currency_type : null,
             universal: !offerCode.products,
             validAt: offerCode.valid_at,
@@ -722,6 +745,7 @@ const DiscountsPage = ({
             maxQuantity: offerCode.limit,
             discount: offerCode.discount,
             selectedProductIds: offerCode.products?.map(({ id }) => id) ?? [],
+            excludedProductIds: offerCode.excluded_products.map(({ id }) => id),
             currencyCode: offerCode.discount.type === "cents" ? offerCode.currency_type : null,
             universal: !offerCode.products,
             validAt: offerCode.valid_at,
@@ -833,6 +857,13 @@ const Form = ({
     value: offerCode?.products?.map(({ id }) => id) ?? [],
   });
   const selectedProducts = products.filter(({ id }) => selectedProductIds.value.includes(id));
+  const [excludedProductIds, setExcludedProductIds] = React.useState<string[]>(
+    offerCode?.excluded_products.map(({ id }) => id) ?? [],
+  );
+  const excludableProductsById = new Map(
+    [...(offerCode?.excluded_products ?? []), ...products].map((product) => [product.id, product]),
+  );
+  const excludedProducts = excludedProductIds.flatMap((id) => excludableProductsById.get(id) ?? []);
 
   const [limitQuantity, setLimitQuantity] = React.useState(!!offerCode?.limit);
   const [maxQuantity, setMaxQuantity] = React.useState<{ value: number | null; error?: boolean }>({
@@ -997,6 +1028,7 @@ const Form = ({
       name: name.value,
       code: code.value,
       products: universal ? null : selectedProducts.map((product) => ({ ...product, uses: 0 })),
+      excluded_products: universal ? excludedProducts : [],
       discount: useTieredDiscounts
         ? { type: "percent", value: sortedTiers[0]?.amountPercentage ?? 0 }
         : { type: discount.type, value: discount.value ?? 0 },
@@ -1138,6 +1170,29 @@ const Form = ({
               All products
             </Label>
           </Fieldset>
+          {universal ? (
+            <Fieldset>
+              <FieldsetTitle>
+                <Label htmlFor={`${uid}excludedProducts`}>Excluded products</Label>
+              </FieldsetTitle>
+              <Select
+                inputId={`${uid}excludedProducts`}
+                instanceId={`${uid}excludedProducts`}
+                options={products
+                  .filter(({ currency_type }) => discount.type !== "cents" || currency_type === currencyCode)
+                  .filter((product) => !product.archived)
+                  .map((product) => ({ id: product.id, label: product.name }))}
+                value={excludedProducts.map(({ id, name: label }) => ({ id, label }))}
+                isMulti
+                isClearable
+                placeholder="Select products to exclude"
+                onChange={(selectedIds) => setExcludedProductIds(selectedIds.map(({ id }) => id))}
+              />
+              <FieldsetDescription>
+                The discount applies to all current and future products except the ones you exclude here.
+              </FieldsetDescription>
+            </Fieldset>
+          ) : null}
           {canSetDuration && !useTieredDiscounts ? (
             <Fieldset>
               <FieldsetTitle>

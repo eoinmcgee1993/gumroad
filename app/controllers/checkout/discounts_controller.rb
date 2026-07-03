@@ -56,9 +56,10 @@ class Checkout::DiscountsController < Sellers::BaseController
 
     parse_date_times
     offer_code = current_seller.offer_codes.build(
-      products: current_seller.products.by_external_ids(offer_code_params[:selected_product_ids]),
-      ownership_products: current_seller.products.by_external_ids(offer_code_params[:ownership_product_ids]),
-      **offer_code_params.except(:selected_product_ids, :ownership_product_ids)
+      products: selected_products,
+      ownership_products:,
+      excluded_products:,
+      **offer_code_params.except(:selected_product_ids, :ownership_product_ids, :excluded_product_ids)
     )
 
     if offer_code.save
@@ -75,15 +76,16 @@ class Checkout::DiscountsController < Sellers::BaseController
     authorize [:checkout, offer_code]
 
     parse_date_times
-    update_params = offer_code_params.except(:selected_product_ids, :ownership_product_ids, :code, :ownership_duration_tiers).to_h
+    update_params = offer_code_params.except(:selected_product_ids, :ownership_product_ids, :excluded_product_ids, :code, :ownership_duration_tiers).to_h
     if params.key?(:ownership_duration_tiers)
       update_params[:ownership_duration_tiers] = params[:ownership_duration_tiers].nil? ? nil : offer_code_params[:ownership_duration_tiers]
     end
 
     if offer_code.update(
       **update_params,
-      products: current_seller.products.by_external_ids(offer_code_params[:selected_product_ids]),
-      ownership_products: current_seller.products.by_external_ids(offer_code_params[:ownership_product_ids])
+      products: selected_products(offer_code),
+      ownership_products: ownership_products(offer_code),
+      excluded_products: excluded_products(offer_code)
     )
       pagination, offer_codes = fetch_offer_codes
       presenter = Checkout::DiscountsPresenter.new(pundit_user:)
@@ -110,9 +112,36 @@ class Checkout::DiscountsController < Sellers::BaseController
         :name, :code, :universal, :max_purchase_count, :amount_cents, :amount_percentage,
         :currency_type, :valid_at, :expires_at, :minimum_quantity, :duration_in_billing_cycles,
         :minimum_amount_cents, :existing_customers_only,
-        selected_product_ids: [], ownership_product_ids: [],
+        selected_product_ids: [], ownership_product_ids: [], excluded_product_ids: [],
         ownership_duration_tiers: [[:months, :amount_percentage]]
       )
+    end
+
+    # Each of these resolves the products for one many-to-many association from the
+    # submitted *_ids. On update, a request may omit a key entirely (e.g. a client
+    # patching only the name): assigning `by_external_ids(nil)` would resolve to an
+    # empty set and silently wipe the saved rows, so when the key is absent we keep
+    # whatever is already persisted. The dashboard form always sends every key, so
+    # this only guards partial or programmatic updates. On create there is no record
+    # to fall back to, so the id list (possibly empty) is always used.
+    def selected_products(offer_code = nil)
+      return offer_code.products if offer_code && !params.key?(:selected_product_ids)
+
+      current_seller.products.by_external_ids(offer_code_params[:selected_product_ids])
+    end
+
+    def ownership_products(offer_code = nil)
+      return offer_code.ownership_products if offer_code && !params.key?(:ownership_product_ids)
+
+      current_seller.products.by_external_ids(offer_code_params[:ownership_product_ids])
+    end
+
+    def excluded_products(offer_code = nil)
+      universal = params.key?(:universal) ? ActiveModel::Type::Boolean.new.cast(offer_code_params[:universal]) : offer_code&.universal?
+      return Link.none unless universal
+      return offer_code.excluded_products if offer_code && !params.key?(:excluded_product_ids)
+
+      current_seller.products.by_external_ids(offer_code_params[:excluded_product_ids])
     end
 
     def paged_params
@@ -145,7 +174,7 @@ class Checkout::DiscountsController < Sellers::BaseController
       offer_codes = current_seller.offer_codes
                       .alive
                       .where.not(code: nil)
-                      .includes(:products, :ownership_products)
+                      .includes(:products, :ownership_products, :excluded_products)
                       .sorted_by(**paged_params[:sort].to_h.symbolize_keys).order(updated_at: :desc)
       offer_codes = offer_codes.where("name LIKE :query OR code LIKE :query", query: "%#{params[:query]}%") if params[:query].present?
       offer_codes_count = offer_codes.count.is_a?(Hash) ? offer_codes.count.length : offer_codes.count

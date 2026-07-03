@@ -219,6 +219,54 @@ describe Checkout::DiscountsController do
       expect(offer_code.minimum_amount_cents).to eq(1000)
     end
 
+    context "when the offer code is universal with excluded products" do
+      before do
+        @product1 = create(:product, user: seller)
+        @product2 = create(:product, user: seller)
+      end
+
+      it "returns HTTP success and creates an offer code with the excluded products" do
+        expect do
+          post :create, params: {
+            name: "Black Friday",
+            code: "bfy2k",
+            amount_percentage: 100,
+            currency_type: nil,
+            universal: true,
+            selected_product_ids: [],
+            excluded_product_ids: [@product2.external_id],
+          }, as: :json
+        end.to change { seller.offer_codes.count }.by(1)
+
+        expect(response).to be_successful
+        expect(response.parsed_body["success"]).to eq(true)
+
+        offer_code = seller.offer_codes.last
+        expect(offer_code.universal).to eq(true)
+        expect(offer_code.products).to eq([])
+        expect(offer_code.excluded_products).to eq([@product2])
+      end
+
+      it "ignores excluded products when the offer code is not universal" do
+        expect do
+          post :create, params: {
+            name: "Black Friday",
+            code: "bfy2k",
+            amount_percentage: 100,
+            currency_type: nil,
+            universal: false,
+            selected_product_ids: [@product1.external_id],
+            excluded_product_ids: [@product2.external_id],
+          }, as: :json
+        end.to change { seller.offer_codes.count }.by(1)
+
+        offer_code = seller.offer_codes.last
+        expect(offer_code.universal).to eq(false)
+        expect(offer_code.products).to eq([@product1])
+        expect(offer_code.excluded_products).to eq([])
+      end
+    end
+
     context "when the offer code has several products" do
       before do
         @product1 = create(:product, user: seller)
@@ -423,6 +471,154 @@ describe Checkout::DiscountsController do
       expect(offer_code.minimum_quantity).to eq(nil)
       expect(offer_code.duration_in_billing_cycles).to eq(nil)
       expect(offer_code.minimum_amount_cents).to eq(nil)
+    end
+
+    it "updates the excluded products of a universal offer code" do
+      excluded_product = create(:product, user: seller)
+      offer_code.update!(universal: true, products: [])
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Discount 1",
+        amount_cents: 100,
+        currency_type: "usd",
+        universal: true,
+        selected_product_ids: [],
+        excluded_product_ids: [excluded_product.external_id],
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(response.parsed_body["success"]).to eq(true)
+
+      offer_code.reload
+      expect(offer_code.universal).to eq(true)
+      expect(offer_code.excluded_products).to eq([excluded_product])
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Discount 1",
+        amount_cents: 100,
+        currency_type: "usd",
+        universal: true,
+        selected_product_ids: [],
+        excluded_product_ids: [],
+      }, as: :json
+
+      offer_code.reload
+      expect(offer_code.excluded_products).to eq([])
+    end
+
+    it "preserves the excluded products when a partial update omits them" do
+      excluded_product = create(:product, user: seller)
+      offer_code.update!(universal: true, products: [], excluded_products: [excluded_product])
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Renamed discount",
+        amount_cents: 100,
+        currency_type: "usd",
+        selected_product_ids: [],
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(response.parsed_body["success"]).to eq(true)
+
+      offer_code.reload
+      expect(offer_code.name).to eq("Renamed discount")
+      expect(offer_code.universal).to eq(true)
+      expect(offer_code.excluded_products).to eq([excluded_product])
+    end
+
+    it "preserves the selected products when a partial update omits them" do
+      subject_product = create(:product, user: seller)
+      offer_code.update!(universal: false, products: [subject_product])
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Renamed discount",
+        amount_cents: 100,
+        currency_type: "usd",
+        universal: false,
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(response.parsed_body["success"]).to eq(true)
+
+      offer_code.reload
+      expect(offer_code.name).to eq("Renamed discount")
+      expect(offer_code.universal).to eq(false)
+      expect(offer_code.products).to eq([subject_product])
+    end
+
+    it "preserves the ownership products when a partial update omits them" do
+      owned_product = create(:product, user: seller)
+      subject_product = create(:product, user: seller, price_cents: 2_00)
+      offer_code.update!(
+        products: [subject_product],
+        ownership_products: [owned_product],
+        existing_customers_only: true,
+        amount_cents: nil,
+        amount_percentage: 25,
+        duration_in_billing_cycles: nil,
+      )
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Renamed discount",
+        amount_percentage: 25,
+        existing_customers_only: true,
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(response.parsed_body["success"]).to eq(true)
+
+      offer_code.reload
+      expect(offer_code.name).to eq("Renamed discount")
+      expect(offer_code.existing_customers_only?).to eq(true)
+      expect(offer_code.ownership_products).to eq([owned_product])
+    end
+
+    it "keeps exclusions for deleted products when their ids are resubmitted" do
+      excluded_product = create(:product, user: seller)
+      offer_code.update!(universal: true, products: [], excluded_products: [excluded_product])
+      excluded_product.mark_deleted!
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Discount 1",
+        amount_cents: 100,
+        currency_type: "usd",
+        universal: true,
+        selected_product_ids: [],
+        excluded_product_ids: [excluded_product.external_id],
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(offer_code.reload.excluded_products).to eq([excluded_product])
+    end
+
+    it "clears the excluded products when the offer code is no longer universal" do
+      excluded_product = create(:product, user: seller)
+      subject_product = create(:product, user: seller)
+      offer_code.update!(universal: true, products: [], excluded_products: [excluded_product])
+
+      put :update, params: {
+        id: offer_code.external_id,
+        name: "Discount 1",
+        amount_cents: 100,
+        currency_type: "usd",
+        universal: false,
+        selected_product_ids: [subject_product.external_id],
+        excluded_product_ids: [excluded_product.external_id],
+      }, as: :json
+
+      expect(response).to be_successful
+      expect(response.parsed_body["success"]).to eq(true)
+
+      offer_code.reload
+      expect(offer_code.universal).to eq(false)
+      expect(offer_code.products).to eq([subject_product])
+      expect(offer_code.excluded_products).to eq([])
     end
 
     it "clears ownership duration tiers when tiering is disabled" do
