@@ -344,6 +344,12 @@ describe Charge::Disputable, :vcr do
         expect(FightDisputeJob).to have_enqueued_sidekiq_job(purchase.dispute.id)
       end
 
+      it "enqueues EnforceRefundPolicyForSellerJob for each purchase" do
+        Purchase.handle_charge_event(event)
+        expect(EnforceRefundPolicyForSellerJob).to have_enqueued_sidekiq_job(purchase.id)
+        expect(FightDisputeJob).to have_enqueued_sidekiq_job(purchase.dispute.id)
+      end
+
       it "calls block_buyer_based_on_chargeback_count! for each purchase" do
         expect_any_instance_of(Purchase).to receive(:block_buyer_based_on_chargeback_count!)
         Purchase.handle_charge_event(event)
@@ -463,6 +469,10 @@ describe Charge::Disputable, :vcr do
 
             it "does not decrement the seller's balance" do
               expect(purchase).to_not receive(:decrement_balance_for_refund_or_chargeback!)
+            end
+
+            it "still enqueues EnforceRefundPolicyForSellerJob so a lost enqueue on the first attempt is recovered" do
+              expect(EnforceRefundPolicyForSellerJob).to have_enqueued_sidekiq_job(purchase.id)
             end
           end
 
