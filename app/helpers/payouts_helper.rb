@@ -10,6 +10,13 @@ module PayoutsHelper
   # rendering the stored note verbatim.
   BELOW_MINIMUM_PAYOUT_NOTE_REGEX = /\A(?:Your payout|Payout) on (?<date>\w+ \d{1,2}, \d{4}) was skipped because (?:your balance of .+ was below|the account balance .+ was less than the minimum payout amount)/
 
+  # Notes written before the below-minimum fix attributed a skipped payout to a
+  # review that doesn't exist ("not_reviewed" is the default state, not an
+  # active review). For a not-reviewed seller whose balance is below the
+  # minimum, the real cause of the skip is the balance, so these stale notes
+  # are folded into the same below-minimum notice instead of being shown.
+  UNDER_REVIEW_PAYOUT_NOTE_REGEX = /\APayout on (?<date>\w+ \d{1,2}, \d{4}) was skipped because the account was under review\.\z/
+
   def formatted_payout_date(payout_date)
     return "" if payout_date.nil?
     payout_date.strftime("%B #{payout_date.day.ordinalize}, %Y")
@@ -87,6 +94,14 @@ module PayoutsHelper
       # The below-minimum skip is folded into the not-payable notice (with the
       # current balance) instead of rendering the stored note verbatim.
       payout_period_data[:skipped_payout_date] = below_minimum_note_match[:date]
+      payout_note = nil
+    elsif payout_period_data[:status] == "not_payable" && user.not_reviewed? && payout_note&.match?(UNDER_REVIEW_PAYOUT_NOTE_REGEX)
+      # A stale "under review" note on a not-reviewed account blames a review
+      # that doesn't exist, so we hide it and let the below-minimum notice
+      # explain the current state. We deliberately don't claim the old skip was
+      # caused by the balance: the note doesn't record the balance at the time,
+      # and it may have been written while the balance was above the minimum
+      # (the account was skipped back then for not being reviewed yet).
       payout_note = nil
     end
     payout_period_data[:payout_note] = payout_note
