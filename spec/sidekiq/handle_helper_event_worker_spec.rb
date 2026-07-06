@@ -25,12 +25,7 @@ describe HandleHelperEventWorker do
 
   describe "#perform" do
     it "triggers UnblockEmailService" do
-      allow_any_instance_of(HelperUserInfoService).to receive(:user_info).and_return({
-                                                                                       user: nil,
-                                                                                       account_infos: [],
-                                                                                       purchase_infos: [],
-                                                                                       recent_purchase: nil,
-                                                                                     })
+      allow_any_instance_of(HelperUserInfoService).to receive(:recent_purchase).and_return(nil)
       expect_any_instance_of(Helper::UnblockEmailService).to receive(:process)
       expect_any_instance_of(Helper::UnblockEmailService).to receive(:replied?)
       described_class.new.perform(@event, @payload)
@@ -52,18 +47,11 @@ describe HandleHelperEventWorker do
       end
     end
 
-    context "when the event is for a new Stripe fraud email" do
-      it "triggers BlockStripeSuspectedFraudulentPaymentsWorker and skips UnblockEmailService" do
-        @payload["email_from"] = BlockStripeSuspectedFraudulentPaymentsWorker::STRIPE_EMAIL_SENDER
-        @payload["subject"] = BlockStripeSuspectedFraudulentPaymentsWorker::POSSIBLE_CONVERSATION_SUBJECTS.sample
-
-        expect_any_instance_of(BlockStripeSuspectedFraudulentPaymentsWorker).to receive(:perform).with(
-          @payload["conversation_id"],
-          @payload["email_from"],
-          @payload["body"]
-        )
+    context "when the email is an automated Stripe notification" do
+      it "does not trigger UnblockEmailService" do
+        expect_any_instance_of(HelperUserInfoService).not_to receive(:recent_purchase)
         expect_any_instance_of(Helper::UnblockEmailService).not_to receive(:process)
-
+        @payload["email_from"] = described_class::STRIPE_NOTIFICATION_SENDER
         described_class.new.perform(@event, @payload)
       end
     end

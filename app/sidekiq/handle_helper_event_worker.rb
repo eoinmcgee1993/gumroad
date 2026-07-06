@@ -7,6 +7,11 @@ class HandleHelperEventWorker
 
   RECENT_PURCHASE_PERIOD = 1.year
   HELPER_EVENTS = %w[conversation.created]
+  # Automated Stripe notification emails (e.g. Radar "suspected fraudulent payment"
+  # alerts) are not from a customer, so the buyer-unblock flow below has nothing to
+  # do for them. Radar fraud signals are handled by the Stripe webhook processor
+  # (StripeChargeRadarProcessor); the conversation itself is left for support triage.
+  STRIPE_NOTIFICATION_SENDER = "notifications@stripe.com"
 
   def perform(event, payload)
     return unless event.in?(HELPER_EVENTS)
@@ -21,13 +26,9 @@ class HandleHelperEventWorker
       return
     end
 
-    if email == BlockStripeSuspectedFraudulentPaymentsWorker::STRIPE_EMAIL_SENDER && BlockStripeSuspectedFraudulentPaymentsWorker::POSSIBLE_CONVERSATION_SUBJECTS.include?(payload["subject"])
-      BlockStripeSuspectedFraudulentPaymentsWorker.new.perform(conversation_id, email, payload["body"])
-      return
-    end
+    return if email == STRIPE_NOTIFICATION_SENDER
 
-    user_info = HelperUserInfoService.new(email:, recent_purchase_period: RECENT_PURCHASE_PERIOD).user_info
-    purchase = user_info[:recent_purchase]
+    purchase = HelperUserInfoService.new(email:, recent_purchase_period: RECENT_PURCHASE_PERIOD).recent_purchase
 
     unblock_email_service = Helper::UnblockEmailService.new(conversation_id:, email_id:, email:)
     unblock_email_service.recent_blocked_purchase = purchase if purchase.try(:buyer_blocked?) && (purchase.stripe_error_code || purchase.error_code).in?(PurchaseErrorCode::UNBLOCK_BUYER_ERROR_CODES)
