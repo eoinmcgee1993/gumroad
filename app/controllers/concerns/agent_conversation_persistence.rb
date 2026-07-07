@@ -105,6 +105,30 @@ module AgentConversationPersistence
       conversation.ai_messages.find(message.id).update!(metadata:)
     end
 
+    # The shape the chat clients (AgentChat.tsx on web, the Agent tab on mobile) hydrate a resumed
+    # conversation from: the plain transcript plus each turn's persisted extras (proposed-action
+    # card, object cards, applied/dismissed status) so history re-renders exactly as it did live.
+    # Shared here so web and mobile can never drift apart on the resume payload.
+    # Hydration is capped at the same window the model replays (HISTORY_MAX_MESSAGES) so a very
+    # long conversation doesn't produce a multi-megabyte resume payload — and so what the seller
+    # sees matches what the model will be shown on the next turn.
+    def agent_conversation_props(conversation)
+      {
+        id: conversation.external_id,
+        title: conversation.title,
+        messages: conversation.ai_messages.last(HISTORY_MAX_MESSAGES).map do |message|
+          metadata = message.metadata || {}
+          {
+            role: message.role,
+            content: message.content,
+            proposed_action: metadata["proposed_action"],
+            objects: metadata["objects"],
+            action_status: metadata["action_status"],
+          }.compact
+        end,
+      }
+    end
+
     # Recursively string-keys hashes and stringifies scalar leaves so the executed request params
     # (which arrive with string values under form encoding, or native types under JSON) compare
     # equal to the stored proposal payload regardless of transport/serialization differences.
