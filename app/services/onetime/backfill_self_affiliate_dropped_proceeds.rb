@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class Onetime::BackfillSelfAffiliateDroppedProceeds
+  include Onetime::RebuildsSellerSettlementAmounts
+
   BUG_INTRODUCED_AT = Time.utc(2026, 4, 28)
   BUG_FIXED_AT = Time.utc(2026, 6, 2)
   REMEDIATION_WINDOW = BUG_INTRODUCED_AT...BUG_FIXED_AT
