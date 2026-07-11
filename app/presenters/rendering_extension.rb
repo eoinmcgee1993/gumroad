@@ -43,6 +43,10 @@ module RenderingExtension
         avatar_url: user.avatar_url,
         confirmed: user.confirmed?,
         team_memberships: UserMembershipsPresenter.new(pundit_user:).props,
+        # Creating a new Gumroad requires a confirmed email (the server enforces
+        # this too) — checking it here hides the menu item instead of letting an
+        # unconfirmed creator fill in the form and get rejected on submit.
+        can_create_brand_account: user.confirmed? && Feature.active?(:brand_accounts, user),
         policies: policies_props(pundit_user),
         is_gumroad_admin: user.is_team_member?,
         is_impersonating:,
