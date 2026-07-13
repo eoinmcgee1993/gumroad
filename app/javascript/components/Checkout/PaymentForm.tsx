@@ -46,6 +46,7 @@ import {
   canUseStripePaymentElementClientConfirm,
   getErrors,
   getStripePaymentElementAmount,
+  getStripePaymentElementMountCurrency,
   getChargeTodayPrice,
   hasShipping,
   isCardReadyToPay,
@@ -706,6 +707,11 @@ const CreditCardContent = ({
       ? state.checkoutPayment.elements_options
       : null;
   const stripePaymentElementAmount = getStripePaymentElementAmount(state);
+  // The element's mount currency — the FX quote's currency on the buyer-currency presentment
+  // lane (stripePaymentElementAmount then carries the quote's local-currency total), canonical
+  // USD otherwise, or null while an in-flight surcharge refresh makes it unknowable so the
+  // input keeps its current mount instead of remounting and wiping entered card details.
+  const stripePaymentElementMountCurrency = getStripePaymentElementMountCurrency(state);
   const handlePaymentElementReady = React.useCallback((controller: PaymentElementController | null) => {
     paymentElementRef.current = controller;
     setPaymentElementReady(controller !== null);
@@ -833,6 +839,7 @@ const CreditCardContent = ({
           ) : null}
           <PaymentElementInput
             amount={stripePaymentElementAmount}
+            mountCurrency={stripePaymentElementMountCurrency}
             elementsOptions={stripePaymentElementConfig}
             disabled={isProcessing(state)}
             defaultEmail={state.email}
