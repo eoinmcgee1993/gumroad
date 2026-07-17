@@ -642,6 +642,33 @@ class Purchase < ApplicationRecord
   }
   scope :paid, -> { successful.where("purchases.price_cents > 0").where("stripe_refunded is null OR stripe_refunded = 0") }
   scope :not_fully_refunded, -> { where("purchases.stripe_refunded IS NULL OR purchases.stripe_refunded = 0") }
+  # Purchase selection for the tax report jobs' sales leg. Pre-cutover purchases keep the
+  # historical exclusion of purchases fully refunded before the cutover (their netted amount
+  # would be zero, and dropping the row is how historical periods were filed). A purchase must
+  # stay in the report whenever any of its refunds is reported as its own refund-period row:
+  # post-cutover purchases always (they report gross amounts), and pre-cutover purchases that
+  # were fully refunded only on/after the cutover (they report amounts net of pre-cutover
+  # refunds, which is still positive — the post-cutover refund row is what offsets the rest).
+  # Dropping such a sale row would leave its refund row with nothing to subtract from,
+  # understating the period pair by the sale amount.
+  #
+  # The post-cutover refund test reuses Refund.effective (the same scope Refund.for_tax_period_reporting
+  # uses to build those refund rows), so a reversed-failure refund — which never gets a refund
+  # row — can't keep an otherwise fully-refunded sale in the report.
+  # See Purchase::Reportable::REFUND_REPORTING_CUTOVER.
+  scope :not_fully_refunded_for_tax_reporting, lambda {
+    cutover = Purchase::Reportable::REFUND_REPORTING_CUTOVER.beginning_of_day
+    effective_post_cutover_refund = Refund.effective
+      .where("refunds.purchase_id = purchases.id")
+      .where("refunds.created_at >= ?", cutover)
+      .select("1")
+    where(
+      "purchases.created_at >= :cutover " \
+      "OR (purchases.stripe_refunded IS NULL OR purchases.stripe_refunded = 0) " \
+      "OR EXISTS (#{effective_post_cutover_refund.to_sql})",
+      cutover:
+    )
+  }
   scope :not_partially_refunded_bundle_product_purchase, -> {
     where("purchases.stripe_partially_refunded IS NULL OR purchases.stripe_partially_refunded = false").or(not_is_bundle_product_purchase)
   }
