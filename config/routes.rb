@@ -1153,6 +1153,7 @@ Rails.application.routes.draw do
         post "/agent/actions", to: "agent_messages#execute", as: :agent_actions
         get "/agent/conversations/latest", to: "agent_conversations#latest", as: :agent_conversations_latest
         get "/agent/turns/:client_turn_id", to: "agent_conversations#turn_status", as: :agent_turn_status
+        post "/agent/custom_html_preview", to: "agent_custom_html_previews#create", as: :agent_custom_html_preview
       end
     end
 

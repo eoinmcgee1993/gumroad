@@ -10,14 +10,20 @@ vi.mock("$app/data/agent", async (importOriginal) => {
     streamAgentMessage: vi.fn(),
     fetchLatestAgentConversation: vi.fn(),
     fetchAgentTurnStatus: vi.fn(),
+    fetchCustomHtmlProposalPreview: vi.fn(),
     executeAgentAction: vi.fn(),
   };
 });
 
 vi.mock("$app/components/server-components/Alert", () => ({ showAlert: vi.fn() }));
 
-const { AgentStreamInterruptedError, fetchAgentTurnStatus, fetchLatestAgentConversation, streamAgentMessage } =
-  vi.mocked(await import("$app/data/agent"), { partial: true });
+const {
+  AgentStreamInterruptedError,
+  fetchAgentTurnStatus,
+  fetchCustomHtmlProposalPreview,
+  fetchLatestAgentConversation,
+  streamAgentMessage,
+} = vi.mocked(await import("$app/data/agent"), { partial: true });
 const { showAlert } = vi.mocked(await import("$app/components/server-components/Alert"));
 const { AgentChat } = await import("$app/components/Agent/AgentChat");
 
@@ -257,5 +263,113 @@ describe("AgentChat streamed reply reconciliation", () => {
     expect(firstId).toBeTruthy();
     expect(secondId).toBeTruthy();
     expect(firstId).not.toBe(secondId);
+  });
+});
+
+describe("AgentChat custom-html proposal cards", () => {
+  const customHtmlAction = {
+    type: "api_write" as const,
+    params: {
+      endpoint: "edit_user_custom_html",
+      path_params: {},
+      params: { find: "<h1>Old headline</h1>", replace: "<h1>New headline</h1>" },
+    },
+    summary: "Edit the custom page.",
+    title: "Edit your page",
+    fields: [
+      { label: "Find", value: "<h1>Old headline</h1>" },
+      { label: "Replace", value: "<h1>New headline</h1>" },
+    ],
+  };
+
+  const streamTurnWithAction = (proposedAction: typeof customHtmlAction) => {
+    streamAgentMessage.mockResolvedValue({
+      reply: "I've prepared the page edit.",
+      proposedAction,
+      objects: [],
+      suggestions: [],
+      conversationId: "conv1",
+    });
+  };
+
+  beforeEach(() => {
+    fetchLatestAgentConversation.mockResolvedValueOnce(null);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("renders a page preview instead of raw HTML fields", async () => {
+    streamTurnWithAction(customHtmlAction);
+    fetchCustomHtmlProposalPreview.mockResolvedValue("<!doctype html><html><body><h1>New headline</h1></body></html>");
+
+    render(<AgentChat greeting="Hi" suggestions={[]} />);
+    await sendMessage("change my headline");
+
+    const iframe = await screen.findByTitle<HTMLIFrameElement>("Preview of your page after this change");
+    expect(iframe.getAttribute("srcdoc")).toContain("<h1>New headline</h1>");
+    // The document renders on an opaque origin, exactly like the live page embed.
+    expect(iframe.getAttribute("sandbox")).toBe("allow-scripts allow-forms allow-popups");
+    // The raw find/replace rows are gone — the rendered preview is the review surface.
+    expect(screen.queryByText("View raw HTML")).toBeNull();
+    expect(screen.queryByText("<h1>Old headline</h1>")).toBeNull();
+    expect(fetchCustomHtmlProposalPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ params: customHtmlAction.params }),
+    );
+    // With the preview rendered, the proposal is confirmable.
+    expect(screen.getByText("Confirm").closest("button")?.disabled).toBe(false);
+  });
+
+  it("disables Confirm until the preview has rendered", async () => {
+    streamTurnWithAction(customHtmlAction);
+    // A fetch that never settles: the card stays in the loading state.
+    fetchCustomHtmlProposalPreview.mockReturnValue(new Promise(() => {}));
+
+    render(<AgentChat greeting="Hi" suggestions={[]} />);
+    await sendMessage("change my headline");
+
+    await waitFor(() => expect(screen.getByText("Loading preview…")).toBeTruthy());
+    // The seller hasn't seen the result yet, so the change can't be applied — but they can
+    // still walk away from it.
+    expect(screen.getByText("Confirm").closest("button")?.disabled).toBe(true);
+    expect(screen.getByText("Dismiss").closest("button")?.disabled).toBe(false);
+  });
+
+  it("shows why a preview is unavailable and keeps Confirm disabled", async () => {
+    streamTurnWithAction(customHtmlAction);
+    fetchCustomHtmlProposalPreview.mockRejectedValue(
+      new Error("The snippet to replace no longer appears in the current page."),
+    );
+
+    render(<AgentChat greeting="Hi" suggestions={[]} />);
+    await sendMessage("change my headline");
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Preview unavailable: The snippet to replace no longer appears in the current page."),
+      ).toBeTruthy(),
+    );
+    // An invalid proposal would fail on apply too — Confirm stays off; Dismiss remains the way out.
+    expect(screen.getByText("Confirm").closest("button")?.disabled).toBe(true);
+    expect(screen.getByText("Dismiss").closest("button")?.disabled).toBe(false);
+  });
+
+  it("leaves non-page proposals on the plain field rows without fetching a preview", async () => {
+    streamTurnWithAction({
+      ...customHtmlAction,
+      params: { endpoint: "update_product", path_params: { id: "abc" }, params: { name: "New name" } },
+      fields: [{ label: "Name", value: "New name" }],
+    });
+
+    render(<AgentChat greeting="Hi" suggestions={[]} />);
+    await sendMessage("rename my product");
+
+    await waitFor(() => expect(screen.getByText("New name")).toBeTruthy());
+    expect(screen.queryByTitle("Preview of your page after this change")).toBeNull();
+    expect(fetchCustomHtmlProposalPreview).not.toHaveBeenCalled();
+    // Non-page proposals never wait on a preview.
+    expect(screen.getByText("Confirm").closest("button")?.disabled).toBe(false);
   });
 });
