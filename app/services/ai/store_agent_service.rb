@@ -30,7 +30,14 @@ class Ai::StoreAgentService
   # network timeouts on real (slow but working) generations, so this is deliberately generous — the
   # client fails fast on connect problems and retries transient failures on its own.
   REQUEST_TIMEOUT_IN_SECONDS = 120
-  MAX_TOOL_ITERATIONS = 5
+  # Upper bound on model turns per reply (each turn may run one or more tools). This has to leave
+  # room for pagination: list endpoints return 10 items per page and the system prompt tells the
+  # model to walk EVERY page for "all of X" tasks, so each page fetch consumes one turn and the
+  # final answer needs one more. The previous cap of 5 meant a seller with more than ~40 products
+  # hit the generic "couldn't finish" fallback on exactly the catalog-wide tasks the pagination
+  # rule exists for. 25 turns covers catalogs of roughly 240 items while still bounding the cost
+  # of a runaway tool loop; past that the honest cap reply below is the correct outcome.
+  MAX_TOOL_ITERATIONS = 25
   MAX_MESSAGE_LENGTH = 2_000
   # Anthropic requires max_tokens on every request. This cap has to fit more than a brief chat
   # reply: when the agent edits a product, the model must emit the ENTIRE new value (for example a
@@ -95,6 +102,11 @@ class Ai::StoreAgentService
     - Only ever act on the current creator's own store. You cannot access other creators' data; the
       API enforces this and an endpoint the creator's role can't use will simply fail.
     - Always use api_read to get real ids and live numbers before acting. Never invent ids.
+    - List endpoints are PAGINATED (usually 10 items per page). When a read result includes a
+      next_page_key, more items exist: call the same endpoint again with page_key set to that value,
+      and keep going until the response has no next_page_key. Any task covering "all" of something
+      (all products, all sales, the whole catalog) requires walking every page first. Never state or
+      imply you checked items you did not actually fetch — if you can't or didn't fetch a page, say so.
     - Never claim a change has already been made. After api_write, tell the creator you've prepared it
       and it's ready for them to confirm.
     - When the creator already has a custom HTML page and asks for a change to it, ALWAYS read the
