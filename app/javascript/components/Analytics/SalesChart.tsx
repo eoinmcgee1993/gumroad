@@ -1,5 +1,5 @@
 import * as React from "react";
-import { XAxis, YAxis, Bar, Line, Cell, Customized } from "recharts";
+import { XAxis, YAxis, Bar, Line, Cell } from "recharts";
 
 import { formatPriceCentsWithCurrencySymbol } from "$app/utils/currency";
 
@@ -64,60 +64,36 @@ type DataPoint = {
   projectedTotals?: number;
 };
 
-// Internal chart state Recharts passes to a `Customized` child: each graphical item
-// (our bars and the totals line) with its computed pixel coordinates and axis scales.
-// Recharts doesn't export this type, so we describe just the parts we read.
-type FormattedGraphicalItem = {
-  item?: { props?: { dataKey?: unknown; yAxisId?: unknown } };
-  props?: {
-    points?: ({ x?: number; y?: number } | null)[];
-    yAxis?: { scale?: (value: number) => number };
-  };
-};
-
-// Draws the projected end-of-day overlay: a small, semi-transparent dotted horizontal
-// tick at the projected total, aligned with the totals line's last point. (An earlier
-// version drew a vertical dashed connector line capped with a circle; seller feedback
-// found that too visually busy, so it's now just the tick.) Rendered through Recharts'
-// `Customized` so we can reuse the pixel coordinates Recharts already computed for the
-// totals line's last point — `ReferenceLine`'s categorical `segment` resolution
-// produced NaN x-coordinates for this chart (duplicate/empty category labels), so we
-// draw the SVG primitives ourselves from known-good coordinates instead.
-const ProjectionOverlay = ({
-  formattedGraphicalItems,
-  projectedTotals,
-}: {
-  formattedGraphicalItems?: FormattedGraphicalItem[];
-  projectedTotals: number;
-}) => {
-  const totalsLine = formattedGraphicalItems?.find(
-    (graphicalItem) => graphicalItem.item?.props?.dataKey === "totals" && graphicalItem.item.props.yAxisId === "totals",
-  );
-  const lastPoint = totalsLine?.props?.points?.[totalsLine.props.points.length - 1];
-  const scale = totalsLine?.props?.yAxis?.scale;
-  if (!lastPoint || typeof scale !== "function") return null;
-  const { x, y } = lastPoint;
-  if (typeof x !== "number" || typeof y !== "number") return null;
-  const projectedY = scale(projectedTotals);
-  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(projectedY)) return null;
-  // A short horizontal tick centered on the totals line's last x-coordinate. Dotted +
-  // semi-transparent so it still reads as a projection rather than an actual data point.
-  const tickHalfWidth = 6;
+// Draws the projected end-of-day marker: a faint accent-colored bar from the axis
+// baseline up to the projected total, behind today's actual bar (same x position and
+// width). The actual day's numbers visibly climb toward the projection as the day
+// progresses. (Earlier versions drew a dashed connector line with a circle cap, then
+// a small dotted tick — seller feedback found both too visually busy, and the tick
+// rendered mispositioned on mobile Safari; see
+// https://github.com/antiwork/gumroad/issues/6048.) Rendered as a custom bar shape so
+// we control the fill opacity and round only the top corners, matching the real bars.
+const ProjectedVolumeBar = ({ x, y, width, height }: { x?: number; y?: number; width?: number; height?: number }) => {
+  if (
+    x == null ||
+    y == null ||
+    width == null ||
+    height == null ||
+    ![x, y, width, height].every(Number.isFinite) ||
+    width <= 0 ||
+    height <= 0
+  )
+    return <g />;
+  const radius = Math.min(4, width / 2, height);
   return (
-    <g>
-      <line
-        x1={x - tickHalfWidth}
-        x2={x + tickHalfWidth}
-        y1={projectedY}
-        y2={projectedY}
-        stroke="rgb(var(--accent))"
-        strokeOpacity={0.5}
-        strokeWidth={2}
-        strokeDasharray="2 2"
-        strokeLinecap="round"
-        data-testid="chart-projected-tick"
-      />
-    </g>
+    <path
+      d={`M ${x},${y + height} L ${x},${y + radius} Q ${x},${y} ${x + radius},${y} L ${x + width - radius},${y} Q ${
+        x + width
+      },${y} ${x + width},${y + radius} L ${x + width},${y + height} Z`}
+      fill="rgb(var(--accent))"
+      fillOpacity={0.2}
+      pointerEvents="none"
+      data-testid="chart-projected-bar"
+    />
   );
 };
 
@@ -267,6 +243,22 @@ export const SalesChart = ({
           })
         }
       />
+      {/* Hidden second x-axis for the projected-volume bar. Bar groups are laid out
+          per axis, so putting the projection bar on its own axis lets it occupy the
+          full band — the same x position and width as the actual stacked bar —
+          instead of being placed side by side with it. */}
+      {projection ? <XAxis xAxisId="projection" dataKey="label" hide /> : null}
+      {/* Rendered before the actual bars so it paints behind them: a faint accent bar
+          rising to the projected end-of-day total, which today's numbers climb toward. */}
+      {projection ? (
+        <Bar
+          dataKey="projectedTotals"
+          xAxisId="projection"
+          yAxisId="totals"
+          shape={ProjectedVolumeBar}
+          isAnimationActive={false}
+        />
+      ) : null}
       <Bar dataKey="sales" stackId="stack" className="fill-current" data-testid="chart-bar" />
       <Bar dataKey="viewsWithoutSales" stackId="stack" radius={[4, 4, 0, 0]} data-testid="chart-bar">
         {dataPoints.map((_, index) => (
@@ -274,25 +266,6 @@ export const SalesChart = ({
         ))}
       </Bar>
       <Line {...lineProps(dotRef, dataPoints.length)} dataKey="totals" yAxisId="totals" />
-      {projection ? (
-        <>
-          {/* Invisible series whose only purpose is to include the projected value in the
-              totals axis domain, so the overlay's dot never lands above the plot area
-              (this replaces ReferenceLine's ifOverflow="extendDomain" behavior). */}
-          <Line
-            dataKey="projectedTotals"
-            yAxisId="totals"
-            stroke="none"
-            dot={false}
-            activeDot={false}
-            isAnimationActive={false}
-          />
-          <Customized
-            key={`projection-${projection.projectedTotals}`}
-            component={<ProjectionOverlay projectedTotals={projection.projectedTotals} />}
-          />
-        </>
-      ) : null}
     </Chart>
   );
 };

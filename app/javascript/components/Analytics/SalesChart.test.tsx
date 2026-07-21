@@ -66,7 +66,7 @@ describe("SalesChart projection overlay", () => {
     vi.useRealTimers();
   });
 
-  it("renders the dotted projection tick with finite coordinates for a daily range ending today", () => {
+  it("renders one faint projection bar behind today's actual bar, same x span, topping out above today's total", () => {
     // Fix "now" to mid-afternoon so the projection guardrails (first hour of the day,
     // completed day) don't suppress the overlay.
     vi.useFakeTimers();
@@ -74,17 +74,50 @@ describe("SalesChart projection overlay", () => {
 
     const { container } = renderChart();
 
-    const projectedTick = container.querySelector("[data-testid='chart-projected-tick']");
-    expect(projectedTick).not.toBeNull();
-    expect(projectedTick?.getAttribute("stroke-dasharray")).toBe("2 2");
+    // The projection bar only carries a value on today's point, so exactly one renders.
+    const bars = container.querySelectorAll("[data-testid='chart-projected-bar']");
+    expect(bars.length).toBe(1);
+    const projectedBar = bars[0];
 
-    for (const attribute of ["x1", "x2", "y1", "y2"]) {
-      expect(Number.isFinite(Number(projectedTick?.getAttribute(attribute)))).toBe(true);
+    // Its horizontal span must match today's actual sales bar (same x position and
+    // width) — Sahil's spec: the faint bar sits directly behind the real one so the
+    // day's numbers visibly climb toward the projection.
+    const actualBars = container.querySelectorAll("path[data-testid='chart-bar']");
+    expect(actualBars.length).toBeGreaterThan(0);
+    let todaysBar: Element | null = null;
+    let maxX = -Infinity;
+    for (const bar of actualBars) {
+      const barX = Number(bar.getAttribute("x"));
+      if (barX > maxX) {
+        maxX = barX;
+        todaysBar = bar;
+      }
     }
-    // The tick is horizontal (constant y) and has real width along x.
-    expect(Number(projectedTick?.getAttribute("y1"))).toBe(Number(projectedTick?.getAttribute("y2")));
-    expect(Number(projectedTick?.getAttribute("x2"))).toBeGreaterThan(Number(projectedTick?.getAttribute("x1")));
-    // The old vertical connector line and circle cap are gone.
+    expect(todaysBar).not.toBeNull();
+    const pathXValues = [...(projectedBar?.getAttribute("d") ?? "").matchAll(/[ML] ([\d.]+),/gu)].map((match) =>
+      Number(match[1]),
+    );
+    expect(pathXValues.length).toBeGreaterThan(0);
+    expect(Math.min(...pathXValues)).toBeCloseTo(Number(todaysBar?.getAttribute("x")), 5);
+    expect(Math.max(...pathXValues)).toBeCloseTo(
+      Number(todaysBar?.getAttribute("x")) + Number(todaysBar?.getAttribute("width")),
+      5,
+    );
+
+    // Its top must sit above today's actual total on the money axis (a projection is
+    // always higher than the booked total), so the bar visibly rises past the line.
+    const dots = container.querySelectorAll("[data-testid='chart-dot']");
+    const lastDot = dots[dots.length - 1];
+    expect(lastDot).toBeDefined();
+    const pathYValues = [...(projectedBar?.getAttribute("d") ?? "").matchAll(/,([\d.]+)/gu)].map((match) =>
+      Number(match[1]),
+    );
+    expect(pathYValues.length).toBeGreaterThan(0);
+    expect(Math.min(...pathYValues)).toBeLessThan(Number(lastDot?.getAttribute("cy")));
+
+    // The earlier marker treatments are gone: no dotted tick, no vertical connector
+    // line, no circle cap (see #6048 — the tick rendered mispositioned on mobile).
+    expect(container.querySelector("[data-testid='chart-projected-tick']")).toBeNull();
     expect(container.querySelector("[data-testid='chart-projection-line']")).toBeNull();
     expect(container.querySelector("[data-testid='chart-projected-dot']")).toBeNull();
 
@@ -97,7 +130,7 @@ describe("SalesChart projection overlay", () => {
 
     const { container } = renderChart({ aggregateBy: "monthly" });
 
-    expect(container.querySelector("[data-testid='chart-projected-tick']")).toBeNull();
+    expect(container.querySelector("[data-testid='chart-projected-bar']")).toBeNull();
     expectNoNaNAttributes(container);
   });
 
@@ -107,7 +140,7 @@ describe("SalesChart projection overlay", () => {
 
     const { container } = renderChart({ endDate: "Jul 10" });
 
-    expect(container.querySelector("[data-testid='chart-projected-tick']")).toBeNull();
+    expect(container.querySelector("[data-testid='chart-projected-bar']")).toBeNull();
     expectNoNaNAttributes(container);
   });
 });
