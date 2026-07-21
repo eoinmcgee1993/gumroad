@@ -137,15 +137,58 @@ class AssetPreview < ApplicationRecord
   def resize_oversized_image!
     return unless oversized_image?
 
+    # Remember which blob we are resizing. Resizing a huge original can take
+    # a while (that slowness is the whole reason this runs in a background
+    # job), and the cover can be replaced or deleted in the meantime. Without
+    # this check the job would attach its resized copy of the OLD image,
+    # silently clobbering the seller's newer cover.
+    source_blob_id = file.blob.id
+
     resized = file.variant(resize_to_limit: [MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION]).processed
 
-    resized.blob.open do |tempfile|
-      file.attach(
+    # Upload the resized copy to storage BEFORE taking the row lock, so the
+    # lock is never held across network I/O.
+    resized_blob = resized.blob.open do |tempfile|
+      ActiveStorage::Blob.create_and_upload!(
         io: tempfile,
         filename: file.filename,
         content_type: file.content_type
       )
     end
+
+    attached_resized_copy = false
+    begin
+      # with_lock reloads the record, so the deleted flag below reflects what
+      # is in the database right now. Locking the asset_previews row alone is
+      # not quite enough, though: a write to the cover's attachment lands in
+      # the active_storage_attachments table without touching this record's
+      # lock. So we also take a row lock on the attachment itself — any
+      # concurrent update or delete of that attachment blocks until this
+      # transaction commits. That closes the window where a change could land
+      # between the blob check and the attach. (Today, "replacing" a cover
+      # actually creates a NEW asset_previews row and soft-deletes the old one
+      # via mark_deleted! — an update on this row, serialized by with_lock —
+      # so the attachment lock is defense in depth for any future path that
+      # re-attaches on an existing row.)
+      with_lock do
+        attachment = ActiveStorage::Attachment.lock.find_by(record: self, name: "file")
+        if !deleted? && attachment&.blob_id == source_blob_id
+          file.attach(resized_blob)
+          attached_resized_copy = true
+        end
+      end
+    ensure
+      # Two ways we can end up here without having attached the resized copy:
+      # the cover changed (or was deleted) while we were resizing, or
+      # something raised after the upload. Either way, clean up the resized
+      # blob instead of leaving it orphaned in storage — purge_later so a
+      # storage hiccup here can't mask an in-flight exception, and so Sidekiq
+      # retries of this job don't pile up one orphan per attempt.
+      resized_blob.purge_later unless attached_resized_copy
+    end
+
+    return unless attached_resized_copy
+
     file.analyze
 
     # Product page JSON caches the cover URLs and dimensions, so bust it now
