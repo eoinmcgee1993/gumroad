@@ -75,6 +75,9 @@ class UrlRedirectPresenter
       product_file_id: product_file.external_id,
       latest_media_location: product_file.latest_media_location_for(purchase),
       title:,
+      # Tells the Read page which in-browser reader to mount: pdf.js for PDFs,
+      # epub.js for EPUBs. `browser_readable?` guarantees one of the two.
+      file_type: product_file.epub? ? "epub" : "pdf",
     }
   end
 
@@ -223,6 +226,8 @@ class UrlRedirectPresenter
     end
 
     def map_file(file)
+      media_location = media_locations_by_file[file.id]
+
       {
         type: "file",
         file_name: file.name_displayable,
@@ -237,10 +242,10 @@ class UrlRedirectPresenter
         kindle_data: file.can_send_to_kindle? ?
                        { email: logged_in_user&.kindle_email, icon_url: ActionController::Base.helpers.image_path("white-15.png") } :
                        nil,
-        latest_media_location: media_locations_by_file[file.id].as_json,
+        latest_media_location: file.media_location_for_download_page(media_location),
         content_length: file.content_length,
         isbn: file.isbn,
-        read_url: file.readable? ? (
+        read_url: file.browser_readable? ? (
           file.is_a?(Link) ? url_redirect_read_url(url_redirect.token) : file.is_a?(ProductFile) ? url_redirect_read_for_product_file_path(url_redirect.token, file.external_id) : nil
         ) : nil,
         external_link_url: file.external_link? ? file.url : nil,
