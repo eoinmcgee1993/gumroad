@@ -101,22 +101,17 @@ module User::SocialGoogle
         user.name = sanitized_name
       end
 
-      # Always update user's email upon log in as it may have changed
-      # on google's side
-      # https://support.google.com/accounts/answer/19870?hl=en
-      #
-      # Exception: if the address Google now reports already belongs to a
-      # DIFFERENT Gumroad account, adopting it would fail the
-      # "An account already exists with this email." validation and the save!
-      # below would raise, locking the user out of Google sign-in entirely.
-      # In that case we keep the account's current email and let the user
-      # sign in as before. (New records skip this check — the caller already
-      # looked the user up by email, so a conflict there is a rare race and
-      # should still surface as a validation failure.)
-      if EmailFormatValidator.valid?(email) && user.email&.downcase != email.downcase
-        email_taken_by_another_account = user.persisted? && User.by_email(email).where.not(id: user.id).exists?
-        user.email = email unless email_taken_by_another_account
-      end
+      # Set the user's email from Google only for brand-new accounts. Returning
+      # sign-ins are matched by google_uid, not email, so there's no need to
+      # re-sync — and re-syncing would clobber a deliberate email change or, if
+      # Google now reports an address owned by another account, fail the
+      # "An account already exists with this email." validation and lock the
+      # user out of Google sign-in. We key off new_user rather than a blank
+      # email because provider-backed accounts are allowed to have no email
+      # (email_required? is false when a provider is set), so a blank email on a
+      # returning login must not adopt a conflicting address either. Mirrors the
+      # Apple path.
+      user.email = email if new_user && EmailFormatValidator.valid?(email)
 
       # Set user's avatar if they don't have one
       user.google_picture_url(data) unless user.avatar.attached?
