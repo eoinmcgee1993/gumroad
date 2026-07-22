@@ -276,6 +276,73 @@ describe AffiliatedProductsPresenter do
         expect(pagination[:page]).to eq(2)
         expect(pagination[:pages]).to eq(2)
       end
+
+      it "computes the pagination total without running the grouped affiliate_credits join" do
+        # The page total used to come from pagy's COUNT(*) OVER () on the full
+        # grouped relation, re-running the expensive affiliate_credits join a
+        # second time per request. The count now comes from a plain
+        # COUNT(DISTINCT link_id, affiliate_id) on the un-grouped scope, so no
+        # counting query should reference affiliate_credits.
+        counting_queries_with_credits_join = []
+        callback = lambda do |_name, _start, _finish, _id, payload|
+          sql = payload[:sql]
+          if sql.match?(/\bCOUNT\b/i) && sql.include?("affiliate_credits") && !sql.include?("COUNT(DISTINCT affiliate_credits")
+            counting_queries_with_credits_join << sql
+          end
+        end
+
+        props = nil
+        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+          props = described_class.new(affiliate_user).affiliated_products_page_props
+        end
+
+        expect(props[:pagination][:pages]).to eq(2)
+        expect(counting_queries_with_credits_join.grep(/OVER \(\)/)).to be_empty
+      end
+
+      it "keeps the pagination total in sync with the grouped rows when duplicate product-affiliate pairs exist" do
+        # The (link, affiliate) uniqueness is enforced only by a model
+        # validation — there is no unique database index — so duplicate rows
+        # for the same pair (e.g. from concurrent writes) can exist in
+        # production. The precomputed pagination count uses the same grouping
+        # keys as the record query, so both must agree even in that state.
+        duplicate = build(:product_affiliate, affiliate: direct_affiliate_one, product: creator_one_product_one, affiliate_basis_points: 25_00)
+        duplicate.save!(validate: false)
+
+        grouped_row_count = described_class.new(affiliate_user).send(:affiliated_products).length
+
+        props = described_class.new(affiliate_user).affiliated_products_page_props
+        expected_pages = (grouped_row_count.to_f / AffiliatedProductsPresenter::PER_PAGE).ceil
+        expect(props[:pagination][:pages]).to eq(expected_pages)
+
+        last_page_props = described_class.new(affiliate_user, page: expected_pages).affiliated_products_page_props
+        expected_last_page_size = grouped_row_count - (expected_pages - 1) * AffiliatedProductsPresenter::PER_PAGE
+        expect(last_page_props[:affiliated_products].count).to eq(expected_last_page_size)
+      end
+
+      it "counts pairs whose basis-points grouping key is NULL" do
+        # The basis-points columns are nullable at the database level
+        # (presence is only enforced by model validations), and MySQL's
+        # multi-column COUNT(DISTINCT ...) silently drops tuples containing a
+        # NULL argument while GROUP BY keeps the NULL-keyed group. With a NULL
+        # link-level value and a zero affiliate-level value, the grouping
+        # expression (NULL || 0) evaluates to NULL in MySQL, so without the
+        # COALESCE wrapper this pair would vanish from the page total and the
+        # last page could become unreachable.
+        pair = ProductAffiliate.find_by(affiliate: direct_affiliate_one, product: creator_one_product_one)
+        pair.update_column(:affiliate_basis_points, nil)
+        direct_affiliate_one.update_column(:affiliate_basis_points, 0)
+
+        grouped_row_count = described_class.new(affiliate_user).send(:affiliated_products).length
+
+        props = described_class.new(affiliate_user).affiliated_products_page_props
+        expected_pages = (grouped_row_count.to_f / AffiliatedProductsPresenter::PER_PAGE).ceil
+        expect(props[:pagination][:pages]).to eq(expected_pages)
+
+        last_page_props = described_class.new(affiliate_user, page: expected_pages).affiliated_products_page_props
+        expected_last_page_size = grouped_row_count - (expected_pages - 1) * AffiliatedProductsPresenter::PER_PAGE
+        expect(last_page_props[:affiliated_products].count).to eq(expected_last_page_size)
+      end
     end
 
     context "when sorting" do

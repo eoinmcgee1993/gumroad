@@ -38,7 +38,32 @@ class AffiliatedProductsPresenter
     attr_reader :user, :query, :page, :sort
 
     def affiliated_products_data
-      pagination, records = pagy_arel(affiliated_products, page:, limit: PER_PAGE, overflow: :last_page)
+      # Pagy's default count for a grouped relation (COUNT(*) OVER ()) executes
+      # the full grouped join against affiliate_credits just to learn how many
+      # rows exist — for affiliates promoting many products that query took
+      # over a second in production traces. Instead, count the distinct
+      # grouping keys on the cheap un-grouped scope, which never touches
+      # affiliate_credits. The keys are the (link_id, affiliate_id) pair plus
+      # the same basis-points expression the grouped query groups by (the
+      # remaining GROUP BY columns are functionally dependent on the pair), so
+      # this matches the grouped row count even if duplicate affiliates_links
+      # rows for one pair slip past the model-level uniqueness validation,
+      # which is not backed by a unique database constraint.
+      #
+      # The basis-points expression is wrapped in COALESCE with a -1 sentinel
+      # because MySQL's multi-column COUNT(DISTINCT a, b, c) silently skips any
+      # tuple where one argument is NULL, while GROUP BY keeps a NULL key as
+      # its own group — without the wrapper, a pair whose basis-points columns
+      # are both NULL (they are nullable at the database level; presence is
+      # only enforced by model validations) would be dropped from the count
+      # and the last page could become unreachable. The || expression only
+      # ever evaluates to 0, 1, or NULL in MySQL, so -1 can never collide
+      # with a real value and the count stays in sync with the grouped rows.
+      count = affiliated_products_scope.distinct.count(
+        "affiliates_links.link_id, affiliates_links.affiliate_id, " \
+        "COALESCE(affiliates_links.affiliate_basis_points || affiliates.affiliate_basis_points, -1)"
+      )
+      pagination, records = pagy_arel(affiliated_products, page:, limit: PER_PAGE, overflow: :last_page, count:)
       records = records.map do |product|
         revenue = product.revenue || 0
         {
