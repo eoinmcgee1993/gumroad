@@ -428,6 +428,14 @@ module StripeMerchantAccountManager
     clear_stale_bank_sync_failure_notes(user)
     :synced
   rescue Stripe::InvalidRequestError => e
+    # Stripe returns "Gumroad has blocked payments on this account..." when the connected
+    # account was rejected by Gumroad itself (a platform-level risk block). No bank account
+    # update can succeed until that block is lifted, so this outcome is expected: don't page
+    # Sentry and don't leave a bank-sync failure note that would trigger automated retries.
+    if e.message.to_s.include?("has blocked payments on this account")
+      return :account_blocked_by_platform
+    end
+
     if e.code == "incorrect_account_holder_name"
       ContactingCreatorMailer.invalid_account_holder_name(user.id).deliver_later(queue: "critical") if notify
       return :invalid_account_holder_name
