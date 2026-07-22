@@ -79,6 +79,11 @@ class MerchantAccount < ApplicationRecord
   # True while a recorded settlement-currency mismatch is fresh — checkout should skip the
   # FX-quote round trip and fall back to canonical USD immediately.
   def settlement_currency_mismatch_active?
+    # The shared Gumroad account settles in USD, so this marker can never be meaningful
+    # there. Treat a marker written before the write guard shipped as inert immediately;
+    # waiting for a manual production cleanup would keep every managed seller in USD.
+    return false if is_managed_by_gumroad?
+
     noticed_at_raw = settlement_currency_mismatch_noticed_at
     return false if noticed_at_raw.blank?
 
@@ -94,7 +99,17 @@ class MerchantAccount < ApplicationRecord
   # Records that Stripe just rejected (or redirected) an FX quote because this account
   # settles in a non-USD currency. Refreshes the timestamp on every occurrence so the TTL
   # measures time since the LAST observed mismatch, not the first.
+  #
+  # Gumroad-managed accounts are exempt: the shared platform account (MerchantAccount.gumroad)
+  # is used by nearly every Gumroad-managed seller and settles in USD, so a mismatch-looking
+  # rejection there (e.g. a stale-session quote expiring at intent create) is never evidence
+  # of a real non-USD settlement configuration. On 2026-07-21 a single stale-session failure
+  # recorded this marker on the shared account and silently suppressed FX quotes for ~all
+  # managed sellers for the whole TTL (gumroad-private#933) — the marker must only ever land
+  # on a seller's own connected account.
   def record_settlement_currency_mismatch!
+    return if is_managed_by_gumroad?
+
     self.settlement_currency_mismatch_noticed_at = Time.current.iso8601
     save!
   end

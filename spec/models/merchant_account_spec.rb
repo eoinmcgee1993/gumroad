@@ -181,6 +181,13 @@ describe MerchantAccount do
         expect(merchant_account.settlement_currency_mismatch_active?).to be(false)
       end
 
+      it "ignores a pre-existing marker on a Gumroad-managed account" do
+        shared_platform_account = create(:merchant_account, user: nil)
+        shared_platform_account.update!(settlement_currency_mismatch_noticed_at: Time.current.iso8601)
+
+        expect(shared_platform_account.reload.settlement_currency_mismatch_active?).to be(false)
+      end
+
       it "is true while the recorded mismatch is fresh" do
         merchant_account.record_settlement_currency_mismatch!
         expect(merchant_account.settlement_currency_mismatch_active?).to be(true)
@@ -203,6 +210,16 @@ describe MerchantAccount do
         travel_to(Time.zone.local(2026, 7, 15, 12)) { merchant_account.record_settlement_currency_mismatch! }
 
         expect(Time.zone.parse(merchant_account.reload.settlement_currency_mismatch_noticed_at)).to eq(Time.zone.local(2026, 7, 15, 12))
+      end
+
+      it "refuses to mark the shared Gumroad-managed platform account, which serves ~all managed sellers and settles USD" do
+        # Regression guard for the 2026-07-21 incident (gumroad-private#933): one
+        # stale-session failure recorded the marker on the shared platform account and
+        # suppressed FX quotes for every Gumroad-managed seller for the 30-day TTL.
+        shared_platform_account = create(:merchant_account, user: nil)
+
+        expect { shared_platform_account.record_settlement_currency_mismatch! }
+          .not_to change { shared_platform_account.reload.settlement_currency_mismatch_noticed_at }
       end
     end
 
