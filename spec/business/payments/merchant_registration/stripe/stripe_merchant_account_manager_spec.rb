@@ -10705,8 +10705,16 @@ describe StripeMerchantAccountManager, :vcr do
               expect(user.reload.payouts_paused_internally?).to be false
               stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
 
+              described_class.handle_stripe_event(stripe_event)
+
+              # The email is debounced: the pause applies instantly, but the mailer
+              # only goes out via a delayed job that re-checks the pause first.
+              expect(StripePayoutsPausedEmailJob).to have_enqueued_sidekiq_job(
+                user.id, merchant_account.id, "action_required", kind_of(String)
+              ).in(described_class::PAYOUTS_PAUSE_EMAIL_DEBOUNCE_DELAY)
+
               expect do
-                described_class.handle_stripe_event(stripe_event)
+                StripePayoutsPausedEmailJob.drain
               end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id)
 
               expect(user.reload.payouts_paused_internally?).to be true
@@ -10744,7 +10752,7 @@ describe StripeMerchantAccountManager, :vcr do
               stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.not_to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id)
+              end.not_to change { StripePayoutsPausedEmailJob.jobs.size }
 
               expect(user.reload.payouts_paused_internally?).to be true
               expect(user.payouts_paused_by).to eq(User.last.id)
@@ -10757,7 +10765,7 @@ describe StripeMerchantAccountManager, :vcr do
 
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.not_to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+              end.not_to change { StripePayoutsPausedEmailJob.jobs.size }
 
               expect(user.reload.payouts_paused_internally?).to be true
             end
@@ -10789,35 +10797,153 @@ describe StripeMerchantAccountManager, :vcr do
               end.not_to change { user.comments.with_type_payouts_paused.count }
             end
 
-            it "sends the action-required email once when Stripe escalates an account already paused for review" do
+            it "schedules the action-required email once when Stripe escalates an account already paused for review" do
               user.update!(payouts_paused_internally: true, payouts_paused_by: User::PAYOUT_PAUSE_SOURCE_STRIPE)
               stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.pending_verification"
               stripe_event["data"]["object"]["requirements"]["currently_due"] = []
               stripe_event["data"]["object"]["requirements"]["past_due"] = []
 
+              # First notice claims the under-review email.
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.not_to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
 
               stripe_event["data"]["object"]["requirements"]["currently_due"] = ["individual.id_number"]
 
+              # Escalation to action-required claims a second (different) email...
               expect do
                 described_class.handle_stripe_event(stripe_event)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
+
+              # ...but a repeat webhook does not claim another.
+              expect do
+                described_class.handle_stripe_event(stripe_event)
+              end.not_to change { StripePayoutsPausedEmailJob.jobs.size }
+
+              # The escalation rotated the claim token, so the pending under-review
+              # job is stale and only the action-required email actually sends.
+              expect do
+                StripePayoutsPausedEmailJob.drain
               end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id)
+                .and(not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review))
+            end
+
+            it "sends the under-review email instead when requirements are satisfied but payouts stay paused before the action-required email sends" do
+              stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
 
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.not_to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
+
+              # Within the debounce window the seller satisfies the past-due
+              # requirement, but payouts remain disabled pending Stripe's review.
+              review_event = stripe_event.deep_dup
+              review_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.pending_verification"
+              review_event["data"]["object"]["requirements"]["past_due"] = []
+              expect do
+                described_class.handle_stripe_event(review_event)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
+
+              # The de-escalation rotated the claim token, so the pending
+              # action-required job is stale: the seller is not told to act
+              # when nothing is due — only the under-review email sends.
+              expect do
+                StripePayoutsPausedEmailJob.drain
+              end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review).with(user.id)
+                .and(not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled))
+            end
+
+            it "invalidates a pending pause email when the account transitions to a rejected state before the debounce elapses" do
+              stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
+
+              expect do
+                described_class.handle_stripe_event(stripe_event)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
+
+              # Stripe rejects the account within the debounce window. Telling
+              # the seller to provide information now would contradict the
+              # rejection, so the claim is dropped entirely.
+              rejected_event = stripe_event.deep_dup
+              rejected_event["data"]["object"]["requirements"]["disabled_reason"] = "rejected.listed"
+              described_class.handle_stripe_event(rejected_event)
+
+              expect(merchant_account.reload.stripe_payouts_pause_email_sent).to be_nil
+              expect(merchant_account.stripe_payouts_pause_email_claim_token).to be_nil
+
+              expect do
+                StripePayoutsPausedEmailJob.drain
+              end.to not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+                .and(not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review))
             end
 
             it "clears the pause-email marker when Stripe re-enables payouts" do
-              merchant_account.update!(stripe_payouts_pause_email_sent: "action_required")
+              merchant_account.update!(stripe_payouts_pause_email_sent: "action_required", stripe_payouts_pause_email_claim_token: "stale-token")
               user.update!(payouts_paused_internally: true, payouts_paused_by: User::PAYOUT_PAUSE_SOURCE_STRIPE)
               stripe_event["data"]["object"]["payouts_enabled"] = true
 
               described_class.handle_stripe_event(stripe_event)
 
               expect(merchant_account.reload.stripe_payouts_pause_email_sent).to be_nil
+              expect(merchant_account.stripe_payouts_pause_email_claim_token).to be_nil
+            end
+
+            it "does not email when the pause resolves before the debounced job runs (Stripe verification blip)" do
+              stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
+
+              expect do
+                described_class.handle_stripe_event(stripe_event)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
+
+              # Stripe re-enables payouts a minute later, before the debounce
+              # window elapses.
+              resume_event = stripe_event.deep_dup
+              resume_event["data"]["object"]["payouts_enabled"] = true
+              described_class.handle_stripe_event(resume_event)
+              expect(user.reload.payouts_paused_internally?).to be false
+
+              # The delayed job runs, sees the pause resolved, and sends nothing.
+              expect do
+                StripePayoutsPausedEmailJob.drain
+              end.to not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+                .and(not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review))
+            end
+
+            it "does not email when the job runs after a non-Stripe resume, and releases the claim so a later pause can email" do
+              stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
+              described_class.handle_stripe_event(stripe_event)
+
+              # An admin resumes payouts before the debounce window elapses. This
+              # path does not clear the email marker itself.
+              user.update!(payouts_paused_internally: false, payouts_paused_by: nil)
+
+              expect do
+                StripePayoutsPausedEmailJob.drain
+              end.to not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+                .and(not_have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review))
+
+              # The skipped email released the claim, as if it was never claimed.
+              expect(merchant_account.reload.stripe_payouts_pause_email_sent).to be_nil
+              expect(merchant_account.stripe_payouts_pause_email_claim_token).to be_nil
+            end
+
+            it "sends exactly one email for the second pause in a pause→resume→pause sequence (only the sustained pause emails)" do
+              stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.past_due"
+              resume_event = stripe_event.deep_dup
+              resume_event["data"]["object"]["payouts_enabled"] = true
+
+              # Blip: pause then resume within the window.
+              described_class.handle_stripe_event(stripe_event)
+              described_class.handle_stripe_event(resume_event)
+
+              # Sustained pause: paused again and still paused when the jobs run.
+              described_class.handle_stripe_event(stripe_event)
+              expect(StripePayoutsPausedEmailJob.jobs.size).to eq(2)
+
+              # Both delayed jobs run; only the one from the second (sustained)
+              # pause matches the current claim token and sends.
+              expect do
+                StripePayoutsPausedEmailJob.drain
+              end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id).once
             end
 
             it "does not re-send the pause email when re-paused after a non-Stripe resume while Stripe stays disabled" do
@@ -10825,14 +10951,14 @@ describe StripeMerchantAccountManager, :vcr do
 
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id)
+              end.to change { StripePayoutsPausedEmailJob.jobs.size }.by(1)
 
               # an admin or update_payout_method resume clears the internal pause but not the marker
               user.update!(payouts_paused_internally: false, payouts_paused_by: nil)
 
               expect do
                 described_class.handle_stripe_event(stripe_event)
-              end.not_to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled)
+              end.not_to change { StripePayoutsPausedEmailJob.jobs.size }
               expect(user.reload.payouts_paused_internally?).to be true
             end
 
@@ -10840,8 +10966,10 @@ describe StripeMerchantAccountManager, :vcr do
               expect(user.reload.payouts_paused_internally?).to be false
               stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "listed"
 
+              described_class.handle_stripe_event(stripe_event)
+
               expect do
-                described_class.handle_stripe_event(stripe_event)
+                StripePayoutsPausedEmailJob.drain
               end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_disabled).with(user.id)
 
               expect(user.reload.payouts_paused_internally?).to be true
@@ -10880,8 +11008,14 @@ describe StripeMerchantAccountManager, :vcr do
               it "sends the under-review email for a non-rejected reason with no outstanding requirements" do
                 stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.pending_verification"
 
+                described_class.handle_stripe_event(stripe_event)
+
+                expect(StripePayoutsPausedEmailJob).to have_enqueued_sidekiq_job(
+                  user.id, merchant_account.id, "under_review", kind_of(String)
+                ).in(described_class::PAYOUTS_PAUSE_EMAIL_DEBOUNCE_DELAY)
+
                 expect do
-                  described_class.handle_stripe_event(stripe_event)
+                  StripePayoutsPausedEmailJob.drain
                 end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review).with(user.id)
 
                 expect(user.reload.payouts_paused_internally?).to be true
@@ -10891,8 +11025,10 @@ describe StripeMerchantAccountManager, :vcr do
                 stripe_event["data"]["object"]["requirements"]["disabled_reason"] = "requirements.pending_verification"
                 stripe_event["data"]["object"]["requirements"]["eventually_due"] = ["individual.id_number"]
 
+                described_class.handle_stripe_event(stripe_event)
+
                 expect do
-                  described_class.handle_stripe_event(stripe_event)
+                  StripePayoutsPausedEmailJob.drain
                 end.to have_enqueued_mail(MerchantRegistrationMailer, :stripe_payouts_under_review).with(user.id)
 
                 expect(user.reload.payouts_paused_internally?).to be true
