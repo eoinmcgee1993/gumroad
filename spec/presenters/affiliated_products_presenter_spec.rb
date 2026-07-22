@@ -550,4 +550,46 @@ describe AffiliatedProductsPresenter do
       expect(described_class.new(seller).affiliated_products_page_props[:archived_tab_visible]).to eq(false)
     end
   end
+
+  describe "revenue stats caching" do
+    let(:user) { create(:affiliate_user) }
+
+    it "caches total_revenue per user and expires it after the TTL" do
+      expect(user).to receive(:affiliate_credits_sum_total).once.and_return(1234)
+
+      presenter = described_class.new(user)
+      expect(presenter.affiliated_products_page_props[:stats][:total_revenue]).to eq 1234
+      # A second render within the TTL serves the aggregate from the cache
+      # rather than re-running the expensive sum (hence `.once` above).
+      expect(described_class.new(user).affiliated_products_page_props[:stats][:total_revenue]).to eq 1234
+
+      travel_to(described_class::STATS_CACHE_TTL.from_now + 1.second) do
+        expect(user).to receive(:affiliate_credits_sum_total).once.and_return(5678)
+        expect(described_class.new(user).affiliated_products_page_props[:stats][:total_revenue]).to eq 5678
+      end
+    end
+
+    it "caches the raw global affiliate earnings but formats them fresh on every request" do
+      # Only the expensive cents sum is cached; the currency formatting runs
+      # each time so a changed display preference is reflected immediately.
+      expect_any_instance_of(GlobalAffiliate).to receive(:total_cents_earned).once.and_return(1234)
+
+      expect(described_class.new(user).affiliated_products_page_props[:global_affiliates_data][:global_affiliate_sales]).to eq "$12.34"
+      expect(described_class.new(user).affiliated_products_page_props[:global_affiliates_data][:global_affiliate_sales]).to eq "$12.34"
+
+      # A formatting-preference change takes effect without waiting for the
+      # cached cents to expire.
+      allow_any_instance_of(User).to receive(:should_be_shown_currencies_always?).and_return(true)
+      expect(described_class.new(user).affiliated_products_page_props[:global_affiliates_data][:global_affiliate_sales]).to eq "$12.34 USD"
+    end
+
+    it "does not share cached revenue between users" do
+      other_user = create(:affiliate_user)
+      expect(user).to receive(:affiliate_credits_sum_total).and_return(100)
+      expect(other_user).to receive(:affiliate_credits_sum_total).and_return(200)
+
+      expect(described_class.new(user).affiliated_products_page_props[:stats][:total_revenue]).to eq 100
+      expect(described_class.new(other_user).affiliated_products_page_props[:stats][:total_revenue]).to eq 200
+    end
+  end
 end
