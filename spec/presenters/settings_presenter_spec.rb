@@ -876,6 +876,54 @@ describe SettingsPresenter do
                                                                      }))
       end
 
+      it "surfaces a Stripe postal-code rejection as a compliance action while payout setup is blocked" do
+        # Regression coverage for gumroad-private#1247: Stripe rejects the postal code
+        # asynchronously after the settings save, so without this banner the seller sees a
+        # successful save and retries blindly.
+        seller.add_payout_note(content: "#{StripeMerchantAccountManager::POSTAL_CODE_FAILURE_NOTE_PREFIX}: postal_code_invalid — Invalid NL postal code")
+
+        account_status = presenter.payments_props[:account_status]
+        expect(account_status[:show_section]).to eq(true)
+        expect(account_status[:compliance_actions]).to contain_exactly(
+          hash_including(message: a_string_matching(/couldn't verify the postal code you entered for United States/), href: nil)
+        )
+      end
+
+      it "does not surface the postal-code rejection once a Stripe account exists" do
+        create(:merchant_account, user: seller, charge_processor_merchant_id: "acct_postal_note_test")
+        seller.add_payout_note(content: "#{StripeMerchantAccountManager::POSTAL_CODE_FAILURE_NOTE_PREFIX}: postal_code_invalid — Invalid NL postal code")
+
+        expect(presenter.payments_props[:account_status][:compliance_actions]).to eq([])
+      end
+
+      it "does not surface a postal-code rejection whose breadcrumb note was cleared" do
+        # The note is soft-deleted when a later account creation succeeds or the seller
+        # saves a corrected address, so a deleted note means the block is resolved.
+        note = seller.add_payout_note(content: "#{StripeMerchantAccountManager::POSTAL_CODE_FAILURE_NOTE_PREFIX}: postal_code_invalid — Invalid NL postal code")
+        note.update!(deleted_at: Time.current)
+
+        account_status = presenter.payments_props[:account_status]
+        expect(account_status[:compliance_actions]).to eq([])
+        expect(account_status[:show_section]).to eq(false)
+      end
+
+      it "does not surface a postal-code rejection that predates the seller's latest compliance-info save" do
+        # If the seller corrects their address and the next account-creation attempt fails
+        # for an unrelated reason, the old note stays alive (it's only cleared on success).
+        # The rejection is stale — it belongs to the pre-correction address — so the banner
+        # must not blame the corrected postal code.
+        note = seller.add_payout_note(content: "#{StripeMerchantAccountManager::POSTAL_CODE_FAILURE_NOTE_PREFIX}: postal_code_invalid — Invalid NL postal code")
+        note.update!(created_at: 1.day.ago)
+        seller.alive_user_compliance_info.dup_and_save! do |info|
+          info.zip_code = "94104"
+          info.skip_stripe_job_on_create = true
+        end
+
+        account_status = presenter.payments_props[:account_status]
+        expect(account_status[:compliance_actions]).to eq([])
+        expect(account_status[:show_section]).to eq(false)
+      end
+
       it "flags the Stripe account as rejected and hides the remediation link when the rejection is terminal" do
         merchant_account = create(:merchant_account, user: seller, stripe_disabled_reason: "rejected.listed")
         create(:balance, user: seller, merchant_account:, amount_cents: 50)

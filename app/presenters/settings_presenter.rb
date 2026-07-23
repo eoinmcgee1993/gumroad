@@ -303,6 +303,36 @@ class SettingsPresenter
   end
 
   private
+    # True when the most recent Stripe account-creation attempt failed because Stripe
+    # rejected the seller's postal code. The failure leaves a breadcrumb payout note
+    # (written by StripeMerchantAccountManager, authored by the Gumroad admin account)
+    # that the retry pipeline also keys off; it's soft-deleted when a later attempt
+    # succeeds, so an alive note usually means the block is current.
+    #
+    # One wrinkle: in the account-creation path the note is only cleared when an
+    # attempt SUCCEEDS. If the seller corrects their address and the next attempt
+    # fails for an unrelated reason (say, a bad bank account number), the old
+    # postal-code note is still alive even though the corrected postal code was
+    # never rejected. To avoid blaming an address the seller already fixed, only
+    # treat the note as current when it postdates the seller's latest
+    # compliance-info save (changing the payments form writes a fresh
+    # UserComplianceInfo record — records are immutable and replaced on edit). If
+    # the corrected postal code is in fact still invalid, the next attempt records
+    # a fresh note and the banner comes back.
+    def postal_code_rejected_by_stripe?
+      note = seller.comments
+            .with_type_payout_note
+            .alive
+            .where(author_id: GUMROAD_ADMIN_ID)
+            .where("content LIKE ?", "#{StripeMerchantAccountManager::POSTAL_CODE_FAILURE_NOTE_PREFIX}%")
+            .order(created_at: :desc, id: :desc)
+            .first
+      return false if note.nil?
+
+      compliance_info = seller.alive_user_compliance_info
+      compliance_info.nil? || note.created_at >= compliance_info.created_at
+    end
+
     def country_code_for_compliance_field(field, user_compliance_info)
       case field
       when UserComplianceInfoFields::Business::TAX_ID, UserComplianceInfoFields::Business::VAT_NUMBER
@@ -401,6 +431,25 @@ class SettingsPresenter
         if missing_fields.any?
           compliance_actions << { message: "Please provide: #{missing_fields.uniq.to_sentence}.", href: nil }
         end
+      end
+
+      # Our payment partner (Stripe) rejected the postal code the seller entered, so their
+      # payout account couldn't be created. That rejection happens asynchronously after the
+      # settings save, so without this banner the seller sees a successful save and then
+      # retries blindly (observed sellers re-submitting the same code 4-13 times). The
+      # rejection leaves a "Stripe postal code rejected" payout note on the account, so the
+      # banner self-heals: the note is soft-deleted once an account creation succeeds, and
+      # postal_code_rejected_by_stripe? ignores notes older than the seller's latest
+      # compliance-info save (i.e. a corrected address hides the banner even before the
+      # retry runs). Only shown while there is no live Stripe account (i.e. the rejection
+      # is still what's blocking setup).
+      if stripe_account.blank? && postal_code_rejected_by_stripe?
+        country = seller.alive_user_compliance_info&.legal_entity_country
+        weeks = RetryStripeRejectedPayoutSetupsJob::RETRY_WINDOW_WEEKS
+        compliance_actions << {
+          message: "Our payment partner couldn't verify the postal code you entered#{" for #{country}" if country.present?}. Please double-check it and re-save your address. If you're sure it's correct (for example, a newly built address), you don't need to do anything — we'll automatically re-check it every few days for up to #{weeks} weeks.",
+          href: nil,
+        }
       end
 
       gumroad_status = if is_under_review && !is_suspended
